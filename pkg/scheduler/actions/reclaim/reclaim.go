@@ -70,6 +70,7 @@ func (ra *Action) Execute(ssn *framework.Session) {
 		}
 
 		if ssn.JobStarving(job) {
+			klog.V(4).Infof("JobStarving:%v", ssn.JobStarving(job))
 			if _, found := preemptorsMap[job.Queue]; !found {
 				preemptorsMap[job.Queue] = util.NewPriorityQueue(ssn.JobOrderFn)
 			}
@@ -81,11 +82,13 @@ func (ra *Action) Execute(ssn *framework.Session) {
 				}
 				preemptorTasks[job.UID].Push(task)
 			}
+			klog.V(4).Infof("preemptorsMap len:%v", len(preemptorsMap))
 		}
 	}
 
 	for {
 		// If no queues, break
+		klog.V(4).Infof("queues len:%v", queues.Len())
 		if queues.Empty() {
 			break
 		}
@@ -94,6 +97,7 @@ func (ra *Action) Execute(ssn *framework.Session) {
 		var task *api.TaskInfo
 
 		queue := queues.Pop().(*api.QueueInfo)
+		klog.V(4).Infof("queue:%v", queue.Name)
 		if ssn.Overused(queue) {
 			klog.V(3).Infof("Queue <%s> is overused, ignore it.", queue.Name)
 			continue
@@ -101,12 +105,15 @@ func (ra *Action) Execute(ssn *framework.Session) {
 
 		// Found "high" priority job
 		jobs, found := preemptorsMap[queue.UID]
+		klog.V(4).Infof("preemptorsMap:jobs%v,found:%v", jobs, found)
 		if !found || jobs.Empty() {
 			continue
 		} else {
 			job = jobs.Pop().(*api.JobInfo)
 		}
+		tasks, found := preemptorTasks[job.UID]
 
+		klog.V(4).Infof("job:%v,tasks:%v, found:%v,tasks.Empty():%v,!ssn.JobStarving(job):%v", job.Name, tasks, found, tasks.Empty(), !ssn.JobStarving(job))
 		// Found "high" priority task to reclaim others
 		if tasks, found := preemptorTasks[job.UID]; !found || tasks.Empty() || !ssn.JobStarving(job) {
 			continue
@@ -186,10 +193,11 @@ func (ra *Action) Execute(ssn *framework.Session) {
 
 			resreq := task.InitResreq.Clone()
 			reclaimed := api.EmptyResource()
-
+			klog.V(4).Infof("victimsQueue:%v, len:%v", victimsQueue, victimsQueue.Len())
 			// Reclaim victims for tasks.
 			for !victimsQueue.Empty() {
 				reclaimee := victimsQueue.Pop().(*api.TaskInfo)
+				klog.V(4).Infof("reclaimee:%v", reclaimee)
 				klog.Errorf("Try to reclaim Task <%s/%s> for Tasks <%s/%s>",
 					reclaimee.Namespace, reclaimee.Name, task.Namespace, task.Name)
 				if err := ssn.Evict(reclaimee, "reclaim"); err != nil {
@@ -208,10 +216,17 @@ func (ra *Action) Execute(ssn *framework.Session) {
 				reclaimed, task.Namespace, task.Name, task.InitResreq)
 
 			if task.InitResreq.LessEqual(reclaimed, api.Zero) {
+				// Set eviction occurred info on task before pipelining for cross-session state transfer
+				task.EvictionOccurred = len(victims) > 0
+
 				if err := ssn.Pipeline(task, n.Name); err != nil {
-					klog.Errorf("Failed to pipeline Task <%s/%s> on Node <%s>",
-						task.Namespace, task.Name, n.Name)
+					klog.Errorf("Failed to pipeline Task <%s/%s> on Node <%s>: %v",
+						task.Namespace, task.Name, n.Name, err)
+					continue
 				}
+
+				klog.V(3).Infof("Successfully pipelined Task <%s/%s> to Node <%s>, status: %v, evictionOccurred: %v",
+					task.Namespace, task.Name, n.Name, task.Status, task.EvictionOccurred)
 
 				// Ignore error of pipeline, will be corrected in next scheduling loop.
 				assigned = true

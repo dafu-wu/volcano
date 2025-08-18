@@ -104,7 +104,10 @@ type PodGroupOldState struct {
 //
 // That is current idle resources plus released resources minus pipelined resources.
 func (ni *NodeInfo) FutureIdle() *Resource {
-	return ni.Idle.Clone().Add(ni.Releasing).SubWithoutAssert(ni.Pipelined)
+	futureIdle := ni.Idle.Clone().Add(ni.Releasing).SubWithoutAssert(ni.Pipelined)
+	klog.V(4).Infof("WucyDebug: FutureIdle calculation for node <%s>: Idle=%v, Releasing=%v, Pipelined=%v, FutureIdle=%v",
+		ni.Name, ni.Idle, ni.Releasing, ni.Pipelined, futureIdle)
+	return futureIdle
 }
 
 // GetNodeAllocatable return node Allocatable without OversubscriptionResource resource
@@ -404,6 +407,7 @@ func (ni *NodeInfo) allocateIdleResource(ti *TaskInfo) {
 //
 // If error occurs both task and node are guaranteed to be in the original state.
 func (ni *NodeInfo) AddTask(task *TaskInfo) error {
+	klog.V(5).Infof("WucyDebug: enter add task: %v", task)
 	if len(task.NodeName) > 0 && len(ni.Name) > 0 && task.NodeName != ni.Name {
 		return fmt.Errorf("task <%v/%v> already on different node <%v>",
 			task.Namespace, task.Name, task.NodeName)

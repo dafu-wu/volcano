@@ -410,6 +410,7 @@ func (r *Resource) LessEqual(rr *Resource, defaultValue DimensionDefaultValue) b
 
 	if defaultValue == Infinity {
 		for name := range rr.ScalarResources {
+			klog.V(4).Infof("[WucyDebug5] name:%v,r.ScalarResources[name]:%v", name, r.ScalarResources[name])
 			if _, ok := r.ScalarResources[name]; !ok {
 				return false
 			}
@@ -418,6 +419,7 @@ func (r *Resource) LessEqual(rr *Resource, defaultValue DimensionDefaultValue) b
 
 	for resourceName, leftValue := range r.ScalarResources {
 		rightValue, ok := rr.ScalarResources[resourceName]
+		klog.V(4).Infof("[WucyDebug6] resourceName:%v,leftValue:%v,rightValue:%v", resourceName, leftValue, rightValue)
 		if !ok && defaultValue == Infinity {
 			continue
 		}
@@ -437,18 +439,22 @@ func (r *Resource) LessEqualWithDimension(rr *Resource, req *Resource) bool {
 		return true
 	}
 	if rr == nil {
+		klog.V(4).Infof("deserved rr:%v", rr)
 		return false
 	}
 	if req == nil {
+		klog.V(4).Infof("r.LessEqual(rr, Zero):%v", r.LessEqual(rr, Zero))
 		return r.LessEqual(rr, Zero)
 	}
 
-	if req.MilliCPU > 0 && r.MilliCPU > rr.MilliCPU {
-		return false
-	}
-	if req.Memory > 0 && r.Memory > rr.Memory {
-		return false
-	}
+	// if req.MilliCPU > 0 && r.MilliCPU > rr.MilliCPU {
+	// 	klog.V(4).Infof("r.MilliCPU:%v,rr.MilliCPU:%v", r.MilliCPU, rr.MilliCPU)
+	// 	return false
+	// }
+	// if req.Memory > 0 && r.Memory > rr.Memory {
+	// 	klog.V(4).Infof("r.Memory :%v,rr.Memory :%v", r.Memory, rr.Memory)
+	// 	return false
+	// }
 
 	// if r.scalar is nil, whatever rr.scalar is, r is less or equal to rr
 	if r.ScalarResources == nil {
@@ -461,6 +467,7 @@ func (r *Resource) LessEqualWithDimension(rr *Resource, req *Resource) bool {
 		}
 		rQuant := r.ScalarResources[name]
 		rrQuant := rr.ScalarResources[name]
+		klog.V(4).Infof("name:%v, quant:%v, rQuant:%v,rrQuant:%v", name, quant, rQuant, rrQuant)
 		if quant > 0 && rQuant > rrQuant {
 			return false
 		}

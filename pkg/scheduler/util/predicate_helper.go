@@ -36,10 +36,30 @@ func (ph *predicateHelper) PredicateNodes(task *api.TaskInfo, nodes []*api.NodeI
 	if allNodes == 0 {
 		return make([]*api.NodeInfo, 0), fe
 	}
+
 	numNodesToFind := CalculateNumOfFeasibleNodesToFind(int32(allNodes))
 
 	//allocate enough space to avoid growing it
 	predicateNodes := make([]*api.NodeInfo, numNodesToFind)
+
+	for _, n := range nodes {
+		for _, t := range n.Tasks {
+			if t.Name == task.Name && t.Namespace == task.Namespace {
+				// If the task is pipelined to this node, return it as it already passed predicates
+				if t.Status == api.Pipelined && t.NodeName == n.Name {
+					klog.V(4).Infof("WucyDebug: Found pipelined task %s/%s on node %s, returning it for allocation", task.Namespace, task.Name, n.Name)
+					return []*api.NodeInfo{n}, fe
+				}
+				// If the task already exists on this node in any other status (Allocated, Binding, etc.),
+				// skip this node entirely to avoid duplicate allocation attempts
+				klog.V(4).Infof("WucyDebug: Task %s/%s already exists on node %s with status %v, skipping this node",
+					task.Namespace, task.Name, n.Name, t.Status)
+				// Continue to the next node - don't include this node in predicate checking
+				goto nextNode
+			}
+		}
+	nextNode:
+	}
 
 	numFoundNodes := int32(0)
 	processedNodes := int32(0)
@@ -78,7 +98,12 @@ func (ph *predicateHelper) PredicateNodes(task *api.TaskInfo, nodes []*api.NodeI
 
 		// TODO (k82cn): Enable eCache for performance improvement.
 		if err := fn(task, node); err != nil {
-			klog.V(3).Infof("Predicates failed: %v", err)
+			klog.V(3).Infof("WucyDebug: Predicates failed: task %s/%s on node %s fit failed: %v",
+				task.Namespace, task.Name, node.Name, err)
+			klog.V(3).Infof("WucyDebug: Task resource request: %v", task.Resreq)
+			klog.V(3).Infof("WucyDebug: Node idle resources: %v", node.Idle)
+			klog.V(3).Infof("WucyDebug: Node used resources: %v", node.Used)
+			klog.V(3).Infof("WucyDebug: Node allocatable resources: %v", node.Allocatable)
 			errorLock.Lock()
 			nodeErrorCache[node.Name] = err
 			ph.taskPredicateErrorCache[taskGroupid] = nodeErrorCache

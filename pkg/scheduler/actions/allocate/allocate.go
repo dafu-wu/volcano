@@ -154,6 +154,8 @@ func (alloc *Action) allocateResources(queues *util.PriorityQueue, jobsMap map[a
 		job := jobs.Pop().(*api.JobInfo)
 		if _, found = pendingTasks[job.UID]; !found {
 			tasks := util.NewPriorityQueue(ssn.TaskOrderFn)
+
+			// Handle Pending tasks first
 			for _, task := range job.TaskStatusIndex[api.Pending] {
 				// Skip tasks whose pod are scheduling gated
 				if task.SchGated {
@@ -169,6 +171,39 @@ func (alloc *Action) allocateResources(queues *util.PriorityQueue, jobsMap map[a
 
 				tasks.Push(task)
 			}
+
+			// Handle Pipelined tasks - try to bind them if resources are available
+			for _, task := range job.TaskStatusIndex[api.Pipelined] {
+				// Skip tasks whose pod are scheduling gated
+				if task.SchGated {
+					continue
+				}
+
+				// Skip BestEffort task in 'allocate' action.
+				if task.Resreq.IsEmpty() {
+					klog.V(4).Infof("Task <%v/%v> is BestEffort task, skip it.",
+						task.Namespace, task.Name)
+					continue
+				}
+
+				// Check if the pipelined node has enough idle resources now
+				if len(task.NodeName) > 0 {
+					if pipelinedNode, ok := ssn.Nodes[task.NodeName]; ok {
+						if task.InitResreq.LessEqual(pipelinedNode.Idle, api.Zero) {
+							klog.V(3).Infof("WucyDebug: Pipelined task %s/%s can now be bound to node %s with available resources",
+								task.Namespace, task.Name, task.NodeName)
+							tasks.Push(task)
+						} else {
+							klog.V(3).Infof("WucyDebug: Pipelined task %s/%s waiting for resources on node %s, idle=%v, required=%v",
+								task.Namespace, task.Name, task.NodeName, pipelinedNode.Idle, task.InitResreq)
+						}
+					}
+				}
+			}
+
+			klog.V(3).Infof("WucyDebug: Job <%s> - Pending tasks: %d, Pipelined tasks: %d, selected for allocation: %d",
+				job.UID, len(job.TaskStatusIndex[api.Pending]), len(job.TaskStatusIndex[api.Pipelined]), tasks.Len())
+
 			pendingTasks[job.UID] = tasks
 		}
 		tasks := pendingTasks[job.UID]
@@ -204,8 +239,20 @@ func (alloc *Action) allocateResources(queues *util.PriorityQueue, jobsMap map[a
 			}
 		}
 
+		klog.V(3).Infof("WucyDebug: Statement check for job <%s>: stmt=%v, operations=%d",
+			job.UID, stmt != nil, func() int {
+				if stmt != nil {
+					return len(stmt.Operations())
+				} else {
+					return 0
+				}
+			}())
 		if stmt != nil {
+			klog.V(3).Infof("WucyDebug: Committing statement for job <%s> with %d operations", job.UID, len(stmt.Operations()))
 			stmt.Commit()
+			klog.V(3).Infof("WucyDebug: Statement committed for job <%s>", job.UID)
+		} else {
+			klog.V(3).Infof("WucyDebug: No statement to commit for job <%s>", job.UID)
 		}
 
 		// Put back the queue to priority queue after job's resource allocating finished,
@@ -344,6 +391,7 @@ func (alloc *Action) selectBestHyperNode(jobStmts map[string]*framework.Statemen
 		return nil, bestHyperNodeName
 	}
 	finalStmt := framework.NewStatement(ssn)
+	klog.V(4).Infof("WucyDebug Allocate bestStmt:%v", bestStmt)
 	err := finalStmt.RecoverOperations(bestStmt)
 	if err != nil {
 		klog.ErrorS(err, "Failed to recover operations", "jobName", job.UID, "hyperNode", bestHyperNodeName)
@@ -362,6 +410,7 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 
 	for !tasks.Empty() {
 		task := tasks.Pop().(*api.TaskInfo)
+
 		if !ssn.Allocatable(queue, task) {
 			klog.V(3).Infof("Queue <%s> is overused when considering task <%s>, ignore it.", queue.Name, task.Name)
 			continue
@@ -423,15 +472,34 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 			task.JobAllocatedHyperNode = jobNewAllocatedHyperNode
 		}
 
-		bestNode, highestScore := alloc.prioritizeNodes(ssn, task, predicateNodes)
+		// Filter out any nil nodes to prevent panic in prioritizeNodes
+		var filteredNodes []*api.NodeInfo
+		for _, node := range predicateNodes {
+			if node != nil {
+				filteredNodes = append(filteredNodes, node)
+			}
+		}
+		if len(filteredNodes) != len(predicateNodes) {
+			klog.V(3).Infof("WucyDebug: Filtered out %d nil nodes for task %s/%s",
+				len(predicateNodes)-len(filteredNodes), task.Namespace, task.Name)
+		}
+
+		bestNode, highestScore := alloc.prioritizeNodes(ssn, task, filteredNodes)
 		if bestNode == nil {
 			continue
 		}
 
 		alloc.sumNodeScoresInHyperNode(string(job.UID), hyperNode, highestScore)
 
+		klog.V(3).Infof("WucyDebug: Calling allocateResourcesForTask for task %s/%s to node %s, current status: %s",
+			task.Namespace, task.Name, bestNode.Name, task.Status)
 		if err := alloc.allocateResourcesForTask(stmt, task, bestNode, job); err == nil {
+			klog.V(3).Infof("WucyDebug: allocateResourcesForTask succeeded for task %s/%s, new status: %s",
+				task.Namespace, task.Name, task.Status)
 			jobNewAllocatedHyperNode = getJobNewAllocatedHyperNode(ssn, bestNode.Name, job, jobNewAllocatedHyperNode)
+		} else {
+			klog.V(3).Infof("WucyDebug: allocateResourcesForTask failed for task %s/%s: %v",
+				task.Namespace, task.Name, err)
 		}
 
 		if ssn.JobReady(job) && !tasks.Empty() {
@@ -439,15 +507,40 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 		}
 	}
 
-	if ssn.JobReady(job) {
-		klog.V(3).InfoS("Job ready, return statement", "jobName", job.UID)
+	// Add detailed debugging for job readiness check
+	jobReady := ssn.JobReady(job)
+	klog.V(3).Infof("WucyDebug: JobReady check for job <%s>: result=%v, ReadyTaskNum=%d, WaitingTaskNum=%d, MinAvailable=%d",
+		job.UID, jobReady, job.ReadyTaskNum(), job.WaitingTaskNum(), job.MinAvailable)
+
+	klog.V(3).Infof("WucyDebug: Statement operations count before decision: %d", len(stmt.Operations()))
+
+	if jobReady {
+		klog.V(3).InfoS("Job ready, return statement with operations", "jobName", job.UID, "operations", len(stmt.Operations()))
 		updateJobAllocatedHyperNode(job, jobNewAllocatedHyperNode)
 		return stmt
 	} else {
-		if !ssn.JobPipelined(job) {
+		// Add detailed debugging for job pipelined check
+		jobPipelined := ssn.JobPipelined(job)
+		klog.V(3).Infof("WucyDebug: JobPipelined check for job <%s>: result=%v, ReadyTaskNum=%d, WaitingTaskNum=%d, PendingBestEffortTaskNum=%d, MinAvailable=%d",
+			job.UID, jobPipelined, job.ReadyTaskNum(), job.WaitingTaskNum(), job.PendingBestEffortTaskNum(), job.MinAvailable)
+
+		if !jobPipelined {
+			klog.V(3).Infof("WucyDebug: Job <%s> failed both JobReady and JobPipelined checks, discarding statement with %d operations",
+				job.UID, len(stmt.Operations()))
 			stmt.Discard()
+			return nil
+		} else {
+			// For pipelined jobs, if we have operations (allocations), return the statement even if not fully ready
+			if len(stmt.Operations()) > 0 {
+				klog.V(3).Infof("WucyDebug: Job <%s> passed JobPipelined check with %d operations, returning statement for partial allocation",
+					job.UID, len(stmt.Operations()))
+				updateJobAllocatedHyperNode(job, jobNewAllocatedHyperNode)
+				return stmt
+			} else {
+				klog.V(3).Infof("WucyDebug: Job <%s> passed JobPipelined check but no operations, returning nil statement", job.UID)
+				return nil
+			}
 		}
-		return nil
 	}
 }
 
@@ -529,11 +622,38 @@ func (alloc *Action) prioritizeNodes(ssn *framework.Session, task *api.TaskInfo,
 		case len(nodes) == 1: // If only one node after predicate, just use it.
 			bestNode = nodes[0]
 		case len(nodes) > 1: // If more than one node after predicate, using "the best" one
-			nodeScores := util.PrioritizeNodes(task, nodes, ssn.BatchNodeOrderFn, ssn.NodeOrderMapFn, ssn.NodeOrderReduceFn)
+			// Additional safety check to ensure no nil nodes are passed to prioritization
+			var validNodes []*api.NodeInfo
+			for _, n := range nodes {
+				if n != nil {
+					validNodes = append(validNodes, n)
+				}
+			}
 
-			bestNode = ssn.BestNodeFn(task, nodeScores)
-			if bestNode == nil {
-				bestNode, higestScore = util.SelectBestNodeAndScore(nodeScores)
+			if len(validNodes) == 0 {
+				klog.V(3).Infof("WucyDebug: All candidate nodes are nil for task %s/%s", task.Namespace, task.Name)
+				continue
+			}
+
+			if len(validNodes) == 1 {
+				bestNode = validNodes[0]
+			} else {
+				nodeScores := util.PrioritizeNodes(task, validNodes, ssn.BatchNodeOrderFn, ssn.NodeOrderMapFn, ssn.NodeOrderReduceFn)
+
+				// Additional safety check for nodeScores
+				if nodeScores == nil || len(nodeScores) == 0 {
+					klog.V(3).Infof("WucyDebug: nodeScores is nil or empty for task %s/%s", task.Namespace, task.Name)
+					continue
+				}
+
+				bestNode = ssn.BestNodeFn(task, nodeScores)
+				if bestNode == nil {
+					bestNode, higestScore = util.SelectBestNodeAndScore(nodeScores)
+					if bestNode == nil {
+						klog.V(3).Infof("WucyDebug: SelectBestNodeAndScore returned nil for task %s/%s", task.Namespace, task.Name)
+						continue
+					}
+				}
 			}
 		}
 
@@ -566,8 +686,8 @@ func (alloc *Action) allocateResourcesForTask(stmt *framework.Statement, task *a
 	klog.V(3).Infof("Predicates failed in allocate for task <%s/%s> on node <%s> with limited resources",
 		task.Namespace, task.Name, node.Name)
 
-	// Allocate releasing resource to the task if any.
-	if task.InitResreq.LessEqual(node.FutureIdle(), api.Zero) {
+	// Only pipeline tasks that are not already pipelined
+	if task.Status != api.Pipelined && task.InitResreq.LessEqual(node.FutureIdle(), api.Zero) {
 		klog.V(3).Infof("Pipelining Task <%v/%v> to node <%v> for <%v> on <%v>",
 			task.Namespace, task.Name, node.Name, task.InitResreq, node.Releasing)
 		if err = stmt.Pipeline(task, node.Name, false); err != nil {
@@ -577,11 +697,45 @@ func (alloc *Action) allocateResourcesForTask(stmt *framework.Statement, task *a
 			metrics.UpdateE2eSchedulingDurationByJob(job.Name, string(job.Queue), job.Namespace, metrics.Duration(job.CreationTimestamp.Time))
 			metrics.UpdateE2eSchedulingLastTimeByJob(job.Name, string(job.Queue), job.Namespace, time.Now())
 		}
+	} else if task.Status == api.Pipelined {
+		klog.V(3).Infof("Task <%v/%v> is already pipelined to node <%v>, waiting for resources to be released",
+			task.Namespace, task.Name, task.NodeName)
 	}
 	return
 }
 
 func (alloc *Action) predicate(task *api.TaskInfo, node *api.NodeInfo) error {
+	// Debug: Always log task info for analysis
+	klog.V(3).Infof("WucyDebug: Predicate check for task %s/%s, status=%s, taskNodeName=%s, podNodeName=%s, currentNode=%s",
+		task.Namespace, task.Name, task.Status, task.NodeName, task.Pod.Spec.NodeName, node.Name)
+
+	// If task is already pipelined to this node, skip resource check
+	if task.Status == api.Pipelined && task.NodeName == node.Name {
+		klog.V(3).Infof("WucyDebug: Found pipelined task %s/%s on node %s", task.Namespace, task.Name, node.Name)
+
+		// Check if task is actually bound to a different node
+		if len(task.Pod.Spec.NodeName) > 0 && task.Pod.Spec.NodeName != node.Name {
+			klog.V(3).Infof("WucyDebug: Task %s/%s is pipelined to node %s but bound to node %s, releasing pipelined resources immediately",
+				task.Namespace, task.Name, node.Name, task.Pod.Spec.NodeName)
+
+			// Immediately release pipelined resources by removing task from node
+			if err := node.RemoveTask(task); err != nil {
+				klog.Errorf("Failed to remove pipelined task %s/%s from node %s: %v", task.Namespace, task.Name, node.Name, err)
+			} else {
+				klog.V(3).Infof("WucyDebug: Successfully released pipelined resources for task %s/%s from node %s",
+					task.Namespace, task.Name, node.Name)
+			}
+
+			// Continue with normal resource check for other tasks
+		} else if len(task.Pod.Spec.NodeName) == 0 {
+			klog.V(3).Infof("WucyDebug: Task %s/%s is pipelined to node %s but not yet bound, skipping resource check", task.Namespace, task.Name, node.Name)
+			return alloc.session.PredicateForAllocateAction(task, node)
+		} else {
+			klog.V(3).Infof("WucyDebug: Task %s/%s is pipelined and bound to same node %s, skipping resource check", task.Namespace, task.Name, node.Name)
+			return alloc.session.PredicateForAllocateAction(task, node)
+		}
+	}
+
 	// Check for Resource Predicate
 	var statusSets api.StatusSets
 	if ok, resources := task.InitResreq.LessEqualWithResourcesName(node.FutureIdle(), api.Zero); !ok {

@@ -17,6 +17,7 @@ limitations under the License.
 package framework
 
 import (
+	"k8s.io/klog/v2"
 	k8sframework "k8s.io/kubernetes/pkg/scheduler/framework"
 
 	"volcano.sh/apis/pkg/apis/scheduling"
@@ -266,11 +267,14 @@ func (ssn *Session) Overused(queue *api.QueueInfo) bool {
 			if !isEnabled(plugin.EnabledOverused) {
 				continue
 			}
+
 			of, found := ssn.overusedFns[plugin.Name]
+			klog.V(4).Infof("Overused plugin.Name:%s,of:%v,found:%v", plugin.Name, of, found)
 			if !found {
 				continue
 			}
 			if of(queue) {
+				klog.V(4).Infof("Overused plugin.Name:%s,of:%v,result:%v", plugin.Name, of, of(queue))
 				return true
 			}
 		}
@@ -284,6 +288,7 @@ func (ssn *Session) Preemptive(queue *api.QueueInfo, candidate *api.TaskInfo) bo
 	for _, tier := range ssn.Tiers {
 		for _, plugin := range tier.Plugins {
 			of, found := ssn.preemptiveFns[plugin.Name]
+			klog.V(4).Infof("plugin.Name:%s,of:%v,found:%v", plugin.Name, of, found)
 			if !isEnabled(plugin.EnablePreemptive) {
 				continue
 			}
@@ -291,6 +296,7 @@ func (ssn *Session) Preemptive(queue *api.QueueInfo, candidate *api.TaskInfo) bo
 				continue
 			}
 			if !of(queue, candidate) {
+				klog.V(4).Infof("plugin.Name:%s,of result:%v", plugin.Name, of(queue, candidate))
 				return false
 			}
 		}
@@ -307,10 +313,12 @@ func (ssn *Session) Allocatable(queue *api.QueueInfo, candidate *api.TaskInfo) b
 				continue
 			}
 			af, found := ssn.allocatableFns[plugin.Name]
+			klog.V(4).Infof("Overused plugin.Name:%s,of:%v,found:%v", plugin.Name, af, found)
 			if !found {
 				continue
 			}
 			if !af(queue, candidate) {
+				klog.V(4).Infof("Overused plugin.Name:%s,of:%v,result:%v", plugin.Name, af, af(queue, candidate))
 				return false
 			}
 		}
@@ -321,22 +329,37 @@ func (ssn *Session) Allocatable(queue *api.QueueInfo, candidate *api.TaskInfo) b
 
 // JobReady invoke jobready function of the plugins
 func (ssn *Session) JobReady(obj interface{}) bool {
+	job, ok := obj.(*api.JobInfo)
+	if !ok {
+		klog.V(3).Infof("WucyDebug: JobReady called with non-JobInfo object")
+		return true
+	}
+
+	klog.V(3).Infof("WucyDebug: JobReady evaluation starting for job <%s>, ReadyTaskNum=%d, MinAvailable=%d",
+		job.UID, job.ReadyTaskNum(), job.MinAvailable)
+
 	for _, tier := range ssn.Tiers {
 		for _, plugin := range tier.Plugins {
 			if !isEnabled(plugin.EnabledJobReady) {
+				klog.V(4).Infof("WucyDebug: JobReady plugin <%s> is disabled, skipping", plugin.Name)
 				continue
 			}
 			jrf, found := ssn.jobReadyFns[plugin.Name]
 			if !found {
+				klog.V(4).Infof("WucyDebug: JobReady plugin <%s> function not found, skipping", plugin.Name)
 				continue
 			}
 
-			if !jrf(obj) {
+			pluginResult := jrf(obj)
+			klog.V(3).Infof("WucyDebug: JobReady plugin <%s> result=%v for job <%s>", plugin.Name, pluginResult, job.UID)
+			if !pluginResult {
+				klog.V(3).Infof("WucyDebug: JobReady failed due to plugin <%s> for job <%s>", plugin.Name, job.UID)
 				return false
 			}
 		}
 	}
 
+	klog.V(3).Infof("WucyDebug: JobReady passed all plugin checks for job <%s>", job.UID)
 	return true
 }
 
@@ -344,18 +367,36 @@ func (ssn *Session) JobReady(obj interface{}) bool {
 // Check if job has get enough resource to run
 func (ssn *Session) JobPipelined(obj interface{}) bool {
 	var hasFound bool
+	job, ok := obj.(*api.JobInfo)
+	if ok {
+		klog.V(3).Infof("WucyDebug: JobPipelined evaluation starting for job <%s>, ReadyTaskNum=%d, WaitingTaskNum=%d, PendingBestEffortTaskNum=%d, MinAvailable=%d",
+			job.UID, job.ReadyTaskNum(), job.WaitingTaskNum(), job.PendingBestEffortTaskNum(), job.MinAvailable)
+	}
+
 	for _, tier := range ssn.Tiers {
 		for _, plugin := range tier.Plugins {
 			if !isEnabled(plugin.EnabledJobPipelined) {
+				if ok {
+					klog.V(4).Infof("WucyDebug: JobPipelined plugin <%s> is disabled, skipping", plugin.Name)
+				}
 				continue
 			}
 			jrf, found := ssn.jobPipelinedFns[plugin.Name]
 			if !found {
+				if ok {
+					klog.V(4).Infof("WucyDebug: JobPipelined plugin <%s> function not found, skipping", plugin.Name)
+				}
 				continue
 			}
 
 			res := jrf(obj)
+			if ok {
+				klog.V(3).Infof("WucyDebug: JobPipelined plugin <%s> result=%d for job <%s>", plugin.Name, res, job.UID)
+			}
 			if res < 0 {
+				if ok {
+					klog.V(3).Infof("WucyDebug: JobPipelined failed due to plugin <%s> returning negative result for job <%s>", plugin.Name, job.UID)
+				}
 				return false
 			}
 			if res > 0 {
@@ -365,10 +406,20 @@ func (ssn *Session) JobPipelined(obj interface{}) bool {
 		// if plugin exists that votes permit, meanwhile other plugin votes abstention,
 		// permit job to be pipelined, do not check next tier
 		if hasFound {
+			if ok {
+				klog.V(3).Infof("WucyDebug: JobPipelined passed due to positive plugin vote for job <%s>", job.UID)
+			}
 			return true
 		}
 	}
 
+	if ok {
+		if hasFound {
+			klog.V(3).Infof("WucyDebug: JobPipelined passed with hasFound=true for job <%s>", job.UID)
+		} else {
+			klog.V(3).Infof("WucyDebug: JobPipelined passed with hasFound=false (default) for job <%s>", job.UID)
+		}
+	}
 	return true
 }
 

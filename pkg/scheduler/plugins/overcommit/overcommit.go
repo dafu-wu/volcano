@@ -81,15 +81,16 @@ func (op *overcommitPlugin) OnSessionOpen(ssn *framework.Session) {
 			" using default value: %f.", op.overCommitFactor, defaultOverCommitFactor)
 		op.overCommitFactor = defaultOverCommitFactor
 	}
-
+	klog.V(5).Infof("ssn.TotalResource:%v,op.totalResource:%v", ssn.TotalResource, op.totalResource)
 	op.totalResource.Add(ssn.TotalResource)
 	// calculate idle resources of total cluster, overcommit resources included
 	used := api.EmptyResource()
 	for _, node := range ssn.Nodes {
 		used.Add(node.Used)
 	}
+	klog.V(5).Infof("ssn.TotalResource:%v,op.totalResource:%v,used:%v,op.overCommitFactor:%v", ssn.TotalResource, op.totalResource, used, op.overCommitFactor)
 	op.idleResource = op.totalResource.Clone().Multi(op.overCommitFactor).SubWithoutAssert(used)
-
+	klog.V(5).Infof("op.idleResource:%v", op.idleResource)
 	for _, job := range ssn.Jobs {
 		// calculate inqueue job resources
 		if job.PodGroup.Status.Phase == scheduling.PodGroupInqueue && job.PodGroup.Spec.MinResources != nil {
@@ -121,6 +122,7 @@ func (op *overcommitPlugin) OnSessionOpen(ssn *framework.Session) {
 
 		//TODO: if allow 1 more job to be inqueue beyond overcommit-factor, large job may be inqueue and create pods
 		jobMinReq := job.GetMinResources()
+		klog.V(4).Infof("job.Namespace:%v, job.Name:%v, idle:%v,inqueue:%v,jobMinReq:%v", job.Namespace, job.Name, idle, inqueue, jobMinReq)
 		if inqueue.Add(jobMinReq).LessEqualWithDimension(idle, jobMinReq) { // only compare the requested resource
 			klog.V(4).Infof("Sufficient resources, permit job <%s/%s> to be inqueue", job.Namespace, job.Name)
 			return util.Permit

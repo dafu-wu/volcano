@@ -32,7 +32,24 @@ func PodKey(pod *v1.Pod) TaskID {
 	return TaskID(key)
 }
 
+const (
+	// VolcanoPipelinedStatusAnnotation marks a pod as pipelined by Volcano scheduler
+	VolcanoPipelinedStatusAnnotation = "volcano.sh/pipelined-status"
+	// VolcanoPipelinedNodeAnnotation stores the node name where the task is pipelined
+	VolcanoPipelinedNodeAnnotation = "volcano.sh/pipelined-node"
+	// VolcanoEvictionOccurredAnnotation indicates if eviction occurred during pipelining
+	VolcanoEvictionOccurredAnnotation = "volcano.sh/eviction-occurred"
+)
+
 func getTaskStatus(pod *v1.Pod) TaskStatus {
+	// First check if the task is in Pipelined state (Volcano-specific)
+	if pod.Annotations != nil {
+		if pipelined, exists := pod.Annotations[VolcanoPipelinedStatusAnnotation]; exists && pipelined == "true" {
+			return Pipelined
+		}
+	}
+
+	// Then check Kubernetes native Pod phases
 	switch pod.Status.Phase {
 	case v1.PodRunning:
 		if pod.DeletionTimestamp != nil {
@@ -60,6 +77,38 @@ func getTaskStatus(pod *v1.Pod) TaskStatus {
 	return Unknown
 }
 
+// SetPipelinedAnnotations sets Volcano pipelined state annotations on pod
+func SetPipelinedAnnotations(pod *v1.Pod, nodeName string, evictionOccurred bool) {
+	if pod.Annotations == nil {
+		pod.Annotations = make(map[string]string)
+	}
+	pod.Annotations[VolcanoPipelinedStatusAnnotation] = "true"
+	pod.Annotations[VolcanoPipelinedNodeAnnotation] = nodeName
+	if evictionOccurred {
+		pod.Annotations[VolcanoEvictionOccurredAnnotation] = "true"
+	}
+}
+
+// ClearPipelinedAnnotations removes Volcano pipelined state annotations from pod
+func ClearPipelinedAnnotations(pod *v1.Pod) {
+	if pod.Annotations != nil {
+		delete(pod.Annotations, VolcanoPipelinedStatusAnnotation)
+		delete(pod.Annotations, VolcanoPipelinedNodeAnnotation)
+		delete(pod.Annotations, VolcanoEvictionOccurredAnnotation)
+	}
+}
+
+// getPipelinedContext extracts pipelined context from pod annotations
+func getPipelinedContext(pod *v1.Pod) (nodeName string, evictionOccurred bool) {
+	if pod.Annotations == nil {
+		return "", false
+	}
+
+	nodeName = pod.Annotations[VolcanoPipelinedNodeAnnotation]
+	evictionOccurred = pod.Annotations[VolcanoEvictionOccurredAnnotation] == "true"
+	return nodeName, evictionOccurred
+}
+
 // PreemptableStatus checks whether the task can be preempted
 func PreemptableStatus(status TaskStatus) bool {
 	switch status {
@@ -78,6 +127,11 @@ func AllocatedStatus(status TaskStatus) bool {
 	default:
 		return false
 	}
+}
+
+// PipelinedStatus checks whether the task is in Pipelined status
+func PipelinedStatus(status TaskStatus) bool {
+	return status == Pipelined
 }
 
 // CompletedStatus checks whether the tasks are completed (regardless of failure or success)

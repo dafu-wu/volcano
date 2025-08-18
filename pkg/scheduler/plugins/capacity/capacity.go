@@ -115,8 +115,9 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 			klog.V(3).Infof("Capacity plugin failed to check queue's hierarchical structure!")
 			return victims, util.Reject
 		}
-
+		klog.V(4).Infof("[WucyDebug0]reclaimees len:%v", len(reclaimees))
 		for _, reclaimee := range reclaimees {
+			klog.V(4).Infof("[WucyDebug1]reclaimees:%v", reclaimee)
 			job := ssn.Jobs[reclaimee.Job]
 			attr := cp.queueOpts[job.Queue]
 
@@ -124,11 +125,18 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 				allocations[job.Queue] = attr.allocated.Clone()
 			}
 			allocated := allocations[job.Queue]
+			klog.V(4).Infof("[WucyDebug2] allocated:%v", allocated)
+			klog.V(4).Infof("[WucyDebug2.1] attr.deserved):%v", attr.deserved)
+			klog.V(4).Infof("[WucyDebug2.2] attr.guarantee:%v", attr.guarantee)
 
 			exceptReclaimee := allocated.Clone().Sub(reclaimee.Resreq)
 			// When scalar resource not specified in deserved such as "pods", we should skip it and consider it as infinity,
 			// so the following first condition will be true and the current queue will not be reclaimed.
+			klog.V(4).Infof("[WucyDebug2.3] exceptReclaimee:%v", exceptReclaimee)
+
 			if allocated.LessEqual(attr.deserved, api.Infinity) || !attr.guarantee.LessEqual(exceptReclaimee, api.Zero) {
+				klog.V(4).Infof("[WucyDebug3] left:%v", allocated.LessEqual(attr.deserved, api.Infinity))
+				klog.V(4).Infof("[WucyDebug4] right:%v", !attr.guarantee.LessEqual(exceptReclaimee, api.Zero))
 				continue
 			}
 			allocated.Sub(reclaimee.Resreq)
@@ -139,6 +147,7 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 	})
 
 	ssn.AddPreemptiveFn(cp.Name(), func(obj interface{}, candidate interface{}) bool {
+		klog.V(3).Infof("AddPreemptiveFn........")
 		if !readyToSchedule {
 			klog.V(3).Infof("Capacity plugin failed to check queue's hierarchical structure!")
 			return false
@@ -153,7 +162,9 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 		attr := cp.queueOpts[queue.UID]
 
 		futureUsed := attr.allocated.Clone().Add(task.Resreq)
+		klog.V(4).Infof("futureUsed:%v,attr.allocated:%v", futureUsed, attr.allocated)
 		overused := !futureUsed.LessEqualWithDimension(attr.deserved, task.Resreq)
+		klog.V(4).Infof("attr:%v, task.Resreq:%v, overused:%v", attr, task.Resreq, overused)
 		metrics.UpdateQueueOverused(attr.name, overused)
 		if overused {
 			klog.V(3).Infof("Queue <%v> can not reclaim, deserved <%v>, allocated <%v>, share <%v>, requested <%v>",
@@ -670,7 +681,8 @@ func (cp *capacityPlugin) checkHierarchicalQueue(attr *queueAttr) error {
 			childAttr.capability.Memory = attr.capability.Memory
 		}
 		// Check if the parent queue's capability is less than the child queue's capability
-		if attr.capability.LessPartly(childAttr.capability, api.Zero) {
+
+		if attr.name != "root" && attr.capability.LessPartly(childAttr.capability, api.Zero) {
 			return fmt.Errorf("queue <%s> capability is less than its child queue <%s>", attr.name, childAttr.name)
 		}
 	}
@@ -696,12 +708,12 @@ func (cp *capacityPlugin) checkHierarchicalQueue(attr *queueAttr) error {
 	}
 
 	// Check if the parent queue's deserved resources are less than the total deserved resources of child queues
-	if attr.deserved.LessPartly(totalDeserved, api.Zero) {
+	if attr.name != "root" && attr.deserved.LessPartly(totalDeserved, api.Zero) {
 		return fmt.Errorf("deserved resources of queue <%s> are less than the sum of its child queues' deserved resources", attr.name)
 	}
 
 	// Check if the parent queue's guarantee resources are less than the total guarantee resources of child queues
-	if attr.guarantee.LessPartly(totalGuarantee, api.Zero) {
+	if attr.name != "root" && attr.guarantee.LessPartly(totalGuarantee, api.Zero) {
 		return fmt.Errorf("guarantee resources of queue <%s> are less than the sum of its child queues' guarantee resources", attr.name)
 	}
 
