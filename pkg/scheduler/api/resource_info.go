@@ -448,12 +448,12 @@ func (r *Resource) LessEqualWithDimension(rr *Resource, req *Resource) bool {
 		return r.LessEqual(rr, Zero)
 	}
 
-	if req.MilliCPU > 0 && r.MilliCPU > rr.MilliCPU {
-		return false
-	}
-	if req.Memory > 0 && r.Memory > rr.Memory {
-		return false
-	}
+	// if req.MilliCPU > 0 && r.MilliCPU > rr.MilliCPU {
+	// 	return false
+	// }
+	// if req.Memory > 0 && r.Memory > rr.Memory {
+	// 	return false
+	// }
 
 	// if r.scalar is nil, whatever rr.scalar is, r is less or equal to rr
 	if r.ScalarResources == nil {

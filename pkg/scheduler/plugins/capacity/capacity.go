@@ -788,7 +788,7 @@ func (cp *capacityPlugin) checkHierarchicalQueue(attr *queueAttr) error {
 		}
 
 		// Check if the parent queue's capability is less than the child queue's capability
-		if attr.capability.LessPartly(childAttr.capability, api.Zero) {
+		if attr.name != "root" && attr.capability.LessPartly(childAttr.capability, api.Zero) {
 			return fmt.Errorf("queue <%s> capability <%s> is less than its child queue <%s> capability <%s>",
 				attr.name, attr.capability, childAttr.name, childAttr.capability)
 		}
