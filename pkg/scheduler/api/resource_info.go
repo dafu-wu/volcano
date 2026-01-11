@@ -202,10 +202,21 @@ func (r *Resource) Get(rn v1.ResourceName) float64 {
 
 // Skip checking "pods" resource.
 // All pods request one "pods" resource now, no need to check it
-var ignoredScalarResources = sets.NewString(string(v1.ResourcePods))
+// You can add more resources to ignore by adding them to this list, for example:
+// var ignoredScalarResources = sets.NewString(string(v1.ResourcePods), "attachable-volumes-csi-cephfs.csi.ceph.com")
+var ignoredScalarResources = sets.NewString(
+	string(v1.ResourcePods),
+	// Add more resources to ignore here as needed
+	"attachable-volumes-csi-cephfs.csi.ceph.com",
+)
 
 func IsIgnoredScalarResource(name v1.ResourceName) bool {
 	return ignoredScalarResources.Has(string(name))
+}
+
+// AddIgnoredScalarResource adds a resource to the ignored list
+func AddIgnoredScalarResource(name string) {
+	ignoredScalarResources.Insert(name)
 }
 
 // IsEmpty returns false if any kind of resource other than IgnoredResources is not less than min value, otherwise returns true
