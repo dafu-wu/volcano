@@ -158,21 +158,34 @@ func (ra *Action) Execute(ssn *framework.Session) {
 			for _, task := range n.Tasks {
 				// Ignore non running task.
 				if task.Status != api.Running {
+					klog.V(4).Infof("Task <%s/%s> on Node <%s> cannot be preempted: task status is %s (not Running)",
+						task.Namespace, task.Name, n.Name, task.Status)
 					continue
 				}
 				if !task.Preemptable {
+					klog.V(4).Infof("Task <%s/%s> on Node <%s> cannot be preempted: task is not preemptable",
+						task.Namespace, task.Name, n.Name)
 					continue
 				}
 
 				if j, found := ssn.Jobs[task.Job]; !found {
+					klog.V(4).Infof("Task <%s/%s> on Node <%s> cannot be preempted: job not found",
+						task.Namespace, task.Name, n.Name)
 					continue
 				} else if j.Queue != job.Queue {
 					q := ssn.Queues[j.Queue]
 					if !q.Reclaimable() {
+						klog.V(4).Infof("Task <%s/%s> on Node <%s> cannot be preempted: queue <%s> is not reclaimable",
+							task.Namespace, task.Name, n.Name, q.Name)
 						continue
 					}
 					// Clone task to avoid modify Task's status on node.
+					klog.V(4).Infof("Task <%s/%s> on Node <%s> can be preempted: task is running, preemptable, and from reclaimable queue <%s>",
+						task.Namespace, task.Name, n.Name, q.Name)
 					reclaimees = append(reclaimees, task.Clone())
+				} else {
+					klog.V(4).Infof("Task <%s/%s> on Node <%s> cannot be preempted: task is from the same queue <%s> as preemptor",
+						task.Namespace, task.Name, n.Name, j.Queue)
 				}
 			}
 
