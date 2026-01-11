@@ -23,6 +23,7 @@ package framework
 import (
 	"context"
 
+	"k8s.io/klog/v2"
 	k8sframework "k8s.io/kubernetes/pkg/scheduler/framework"
 
 	"volcano.sh/apis/pkg/apis/scheduling"
@@ -313,6 +314,14 @@ func (ssn *Session) Preemptive(queue *api.QueueInfo, candidate *api.TaskInfo) bo
 				continue
 			}
 			if !of(queue, candidate) {
+				// Log which plugin rejected the preemptive check
+				if candidate != nil {
+					klog.V(4).Infof("Task <%s/%s> from queue <%s> cannot preempt: rejected by plugin <%s>",
+						candidate.Namespace, candidate.Name, queue.Name, plugin.Name)
+				} else {
+					klog.V(4).Infof("Queue <%s> preemptive check failed: rejected by plugin <%s>",
+						queue.Name, plugin.Name)
+				}
 				return false
 			}
 		}
