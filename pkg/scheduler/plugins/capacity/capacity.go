@@ -158,6 +158,16 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 		} else {
 			klog.V(3).Infof("Queue <%v> can not reclaim, futureUsed: %v, deserved: %v, requested: %v",
 				queue.Name, futureUsed, attr.deserved, task.Resreq)
+		overused := !futureUsed.LessEqualWithDimension(attr.deserved, task.Resreq)
+		metrics.UpdateQueueOverused(attr.name, overused)
+		if overused {
+			klog.V(3).Infof("Queue <%v> cannot reclaim: queue would exceed deserved resources after allocation", queue.Name)
+			klog.V(3).Infof("  Task <%s/%s> resource request: %v", task.Namespace, task.Name, task.Resreq)
+			klog.V(3).Infof("  Queue <%v> deserved: %v, allocated: %v, share: %.2f", queue.Name, attr.deserved, attr.allocated, attr.share)
+			klog.V(3).Infof("  Future usage after allocation: %v (exceeds deserved)", futureUsed)
+			if attr.realCapability != nil {
+				klog.V(3).Infof("  Queue <%v> realCapability: %v, guarantee: %v", queue.Name, attr.realCapability, attr.guarantee)
+			}
 		}
 
 		overused := !isPreemptive
