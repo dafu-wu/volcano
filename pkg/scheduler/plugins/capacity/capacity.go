@@ -158,34 +158,36 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 		} else {
 			klog.V(3).Infof("Queue <%v> can not reclaim, futureUsed: %v, deserved: %v, requested: %v",
 				queue.Name, futureUsed, attr.deserved, task.Resreq)
-		overused := !futureUsed.LessEqualWithDimension(attr.deserved, task.Resreq)
-		metrics.UpdateQueueOverused(attr.name, overused)
-		if overused {
-			klog.V(3).Infof("Queue <%v> cannot reclaim: queue would exceed deserved resources after allocation", queue.Name)
-			klog.V(3).Infof("  Task <%s/%s> resource request: %v", task.Namespace, task.Name, task.Resreq)
-			klog.V(3).Infof("  Queue <%v> deserved: %v, allocated: %v, share: %.2f", queue.Name, attr.deserved, attr.allocated, attr.share)
-			klog.V(3).Infof("  Future usage after allocation: %v", futureUsed)
 
-			// Check which resource dimension exceeds deserved
-			exceedingResources := []string{}
-			for name, quant := range task.Resreq.ScalarResources {
-				if api.IsIgnoredScalarResource(name) {
-					continue
-				}
-				if quant > 0 {
-					futureQuant := futureUsed.Get(name)
-					deservedQuant := attr.deserved.Get(name)
-					if futureQuant > deservedQuant {
-						exceedingResources = append(exceedingResources, fmt.Sprintf("%s (future: %.2f > deserved: %.2f)", name, futureQuant, deservedQuant))
+			// Additional detailed logging when queue cannot reclaim
+			exceedsDeserved, _ := futureUsed.LessEqualWithDimensionAndResourcesName(attr.deserved, task.Resreq)
+			if !exceedsDeserved {
+				klog.V(3).Infof("Queue <%v> cannot reclaim: queue would exceed deserved resources after allocation", queue.Name)
+				klog.V(3).Infof("  Task <%s/%s> resource request: %v", task.Namespace, task.Name, task.Resreq)
+				klog.V(3).Infof("  Queue <%v> deserved: %v, allocated: %v, share: %.2f", queue.Name, attr.deserved, attr.allocated, attr.share)
+				klog.V(3).Infof("  Future usage after allocation: %v", futureUsed)
+
+				// Check which resource dimension exceeds deserved
+				exceedingResources := []string{}
+				for name, quant := range task.Resreq.ScalarResources {
+					if api.IsIgnoredScalarResource(name) {
+						continue
+					}
+					if quant > 0 {
+						futureQuant := futureUsed.Get(name)
+						deservedQuant := attr.deserved.Get(name)
+						if futureQuant > deservedQuant {
+							exceedingResources = append(exceedingResources, fmt.Sprintf("%s (future: %.2f > deserved: %.2f)", name, futureQuant, deservedQuant))
+						}
 					}
 				}
-			}
-			if len(exceedingResources) > 0 {
-				klog.V(3).Infof("  Exceeding resource dimensions: %v", exceedingResources)
-			}
+				if len(exceedingResources) > 0 {
+					klog.V(3).Infof("  Exceeding resource dimensions: %v", exceedingResources)
+				}
 
-			if attr.realCapability != nil {
-				klog.V(3).Infof("  Queue <%v> realCapability: %v, guarantee: %v", queue.Name, attr.realCapability, attr.guarantee)
+				if attr.realCapability != nil {
+					klog.V(3).Infof("  Queue <%v> realCapability: %v, guarantee: %v", queue.Name, attr.realCapability, attr.guarantee)
+				}
 			}
 		}
 
