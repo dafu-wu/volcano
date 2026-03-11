@@ -398,6 +398,11 @@ func (pp *predicatesPlugin) OnSessionOpen(ssn *framework.Session) {
 	// 10. DRA
 	var dynamicResourceAllocationPlugin *dynamicresources.DynamicResources
 	if predicate.dynamicResourceAllocationEnable {
+		// Clean up any stale inFlightAllocations from previous scheduling sessions.
+		// This prevents the "resource claim is in the process of being allocated" error
+		// that occurs when a previous session's Reserve was not properly cleaned up via Unreserve.
+		cleanupStaleDRAPendingAllocations(ssn.SharedDRAManager(), ssn.Jobs)
+
 		var err error
 		plugin, err = dynamicresources.New(context.TODO(), nil, handle, features)
 		if err != nil {
