@@ -25,6 +25,24 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/api"
 )
 
+// countAllPendingAllocations counts the total number of pending (inFlight) allocations
+// by iterating over all claims in the claimTracker via List().
+// This is used for diagnostic logging to understand the DRA state.
+func countAllPendingAllocations(claimTracker k8sframework.ResourceClaimTracker) int {
+	claims, err := claimTracker.List()
+	if err != nil {
+		klog.V(4).Infof("DRA diagnostic: failed to list claims: %v", err)
+		return -1
+	}
+	count := 0
+	for _, claim := range claims {
+		if claimTracker.ClaimHasPendingAllocation(types.UID(claim.UID)) {
+			count++
+		}
+	}
+	return count
+}
+
 // cleanupStaleDRAPendingAllocations removes stale inFlightAllocations from the DRA ResourceClaimTracker.
 //
 // In upstream k8s scheduler, inFlightAllocations are added during Reserve (when a claim allocation is computed)
@@ -50,6 +68,12 @@ func cleanupStaleDRAPendingAllocations(draManager k8sframework.SharedDRAManager,
 	claimTracker := draManager.ResourceClaims()
 	if claimTracker == nil {
 		return
+	}
+
+	// Diagnostic: count total pending allocations BEFORE cleanup (across ALL claims via List(), not just job tasks)
+	pendingBefore := countAllPendingAllocations(claimTracker)
+	if pendingBefore > 0 {
+		klog.V(3).Infof("DRA cleanup diagnostic: BEFORE cleanup, total pending (inFlight) allocations across all claims: %d", pendingBefore)
 	}
 
 	// At the beginning of each new scheduling session, ALL inFlightAllocations from the previous session
@@ -109,11 +133,14 @@ func cleanupStaleDRAPendingAllocations(draManager k8sframework.SharedDRAManager,
 			}
 		}
 	}
-	if cleanedCount > 0 {
+	// Diagnostic: count total pending allocations AFTER cleanup (across ALL claims via List())
+	pendingAfter := countAllPendingAllocations(claimTracker)
+
+	if cleanedCount > 0 || pendingBefore > 0 {
 		klog.Infof("DRA inFlightAllocation cleanup: removed %d stale inFlightAllocations at session start "+
 			"(%d from already-allocated claims causing double-counting, %d from unallocated claims). "+
-			"These leaked inFlightAllocations would have caused DRA Filter to report 'cannot allocate all claims' "+
-			"on nodes where devices are actually free.",
-			cleanedCount, cleanedAllocatedCount, cleanedUnallocatedCount)
+			"Total pending allocations: before=%d, after=%d, leaked=%d (not reachable via job tasks).",
+			cleanedCount, cleanedAllocatedCount, cleanedUnallocatedCount,
+			pendingBefore, pendingAfter, pendingAfter)
 	}
 }

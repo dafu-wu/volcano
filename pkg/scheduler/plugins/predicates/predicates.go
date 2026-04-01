@@ -819,7 +819,30 @@ func (pp *predicatesPlugin) runUnReservePlugins(ssn *framework.Session, event *f
 
 	// DRA UnReserve
 	if pp.dynamicResourceAllocationPlugin != nil {
+		// Diagnostic: count pending allocations before Unreserve
+		var pendingBefore int
+		if draManager := ssn.SharedDRAManager(); draManager != nil {
+			if ct := draManager.ResourceClaims(); ct != nil {
+				pendingBefore = countAllPendingAllocations(ct)
+			}
+		}
+
 		pp.dynamicResourceAllocationPlugin.Unreserve(context.TODO(), state, event.Task.Pod, event.Task.Pod.Spec.NodeName)
+
+		// Diagnostic: count pending allocations after Unreserve
+		if draManager := ssn.SharedDRAManager(); draManager != nil {
+			if ct := draManager.ResourceClaims(); ct != nil {
+				pendingAfter := countAllPendingAllocations(ct)
+				if pendingBefore != pendingAfter {
+					klog.V(4).Infof("DRA Unreserve diagnostic: task %s/%s on node %s - pending allocations: before=%d, after=%d (removed %d)",
+						event.Task.Namespace, event.Task.Name, event.Task.Pod.Spec.NodeName,
+						pendingBefore, pendingAfter, pendingBefore-pendingAfter)
+				} else {
+					klog.V(4).Infof("DRA Unreserve diagnostic: task %s/%s on node %s - Unreserve called but pending allocations unchanged: %d (state may be missing or claim not in-flight)",
+						event.Task.Namespace, event.Task.Name, event.Task.Pod.Spec.NodeName, pendingBefore)
+				}
+			}
+		}
 	}
 }
 
