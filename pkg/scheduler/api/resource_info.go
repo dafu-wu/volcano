@@ -210,8 +210,24 @@ var ignoredScalarResources = sets.NewString(
 	"attachable-volumes-csi-cephfs.csi.ceph.com",
 )
 
+// ignoredScalarResourcePrefixes contains resource name prefixes that should be ignored
+// during resource capacity checks. Resources matching any of these prefixes will be
+// skipped in comparisons like LessEqualWithDimension and IsEmpty.
+var ignoredScalarResourcePrefixes = []string{
+	"nvidia.com/roce_",
+}
+
 func IsIgnoredScalarResource(name v1.ResourceName) bool {
-	return ignoredScalarResources.Has(string(name))
+	if ignoredScalarResources.Has(string(name)) {
+		return true
+	}
+	// Check if the resource name matches any ignored prefix
+	for _, prefix := range ignoredScalarResourcePrefixes {
+		if strings.HasPrefix(string(name), prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // AddIgnoredScalarResource adds a resource to the ignored list
