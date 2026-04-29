@@ -683,6 +683,26 @@ func (pp *predicatesPlugin) OnSessionOpen(ssn *framework.Session) {
 				status := pp.dynamicResourceAllocationPlugin.Filter(context.TODO(), state, task.Pod, nodeInfo)
 				dynamicResourceAllocationStatus := api.ConvertPredicateStatus(status)
 				if dynamicResourceAllocationStatus.Code != api.Success {
+					// Log DRA filter failures to help diagnose "cannot allocate all claims" issues.
+					// We distinguish between stale and legitimate pending allocations:
+					// - Stale: claim has inFlightAllocation but Status.Allocation==nil → leaked from failed scheduling
+					// - Legitimate: claim has inFlightAllocation and Status.Allocation!=nil → being bound to etcd
+					if draManager := ssn.SharedDRAManager(); draManager != nil {
+						if ct := draManager.ResourceClaims(); ct != nil {
+							info := getPendingAllocationInfo(ct)
+							if info.stale > 0 {
+								klog.Warningf("DRA Filter STALE LEAK DETECTED: task %s/%s on node %s failed: %s "+
+									"(stale inFlightAllocations: %d/%d total - these are CONFIRMED stale because their claims "+
+									"have no actual allocation in etcd, leaked claims: %v)",
+									task.Namespace, task.Name, node.Name, dynamicResourceAllocationStatus.Reason,
+									info.stale, info.total, info.staleClaims)
+							} else if info.total > 0 {
+								klog.V(4).Infof("DRA Filter failed for task %s/%s on node %s: %s "+
+									"(pending inFlightAllocations: %d, all legitimate - claims are being bound to etcd)",
+									task.Namespace, task.Name, node.Name, dynamicResourceAllocationStatus.Reason, info.total)
+							}
+						}
+					}
 					predicateStatus = append(predicateStatus, dynamicResourceAllocationStatus)
 					if ShouldAbort(dynamicResourceAllocationStatus) {
 						return api.NewFitErrWithStatus(task, node, predicateStatus...)

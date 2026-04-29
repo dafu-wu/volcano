@@ -784,6 +784,78 @@ func (ssn *Session) SharedDRAManager() k8sframework.SharedDRAManager {
 	return ssn.cache.SharedDRAManager()
 }
 
+// CleanupDRAInFlightAllocations cleans up DRA inFlightAllocation entries for tasks
+// in the given statement without discarding the full statement (preserving Pipelined state).
+//
+// This is needed when a job is Pipelined but not Ready: we want to keep the Pipelined
+// task state for reclaim/preempt visibility and event reporting, but we must remove
+// the DRA inFlightAllocation entries to prevent leaks across jobs in the same session.
+//
+// For each task with ResourceClaims in the statement's operations, this method calls
+// DRA Unreserve to remove the inFlightAllocation, without touching the task's status,
+// node assignment, or other non-DRA state.
+func (ssn *Session) CleanupDRAInFlightAllocations(stmt *Statement, job *api.JobInfo) {
+	draManager := ssn.SharedDRAManager()
+	if draManager == nil {
+		return
+	}
+	claimTracker := draManager.ResourceClaims()
+	if claimTracker == nil {
+		return
+	}
+
+	cleanedCount := 0
+	for _, op := range stmt.Operations() {
+		task := op.task
+		if task == nil || task.Pod == nil || len(task.Pod.Spec.ResourceClaims) == 0 {
+			continue
+		}
+
+		state := ssn.GetCycleState(task.UID)
+		if state == nil {
+			continue
+		}
+
+		// Trigger DRA Unreserve via the event handler chain by firing a targeted
+		// DeallocateFunc for this task. However, we DON'T want to actually deallocate
+		// the task (remove from node, change status to Pending, etc.).
+		// Instead, we directly call the DRA plugin's Unreserve if available.
+		for _, eh := range ssn.eventHandlers {
+			if eh.DeallocateFunc != nil {
+				// We need a way to only call DRA Unreserve without the full deallocation.
+				// Since the event handler chain does GPU release, VolumeBinding Unreserve, etc.
+				// in addition to DRA Unreserve, we can't use DeallocateFunc directly.
+				// Instead, we'll use the ClaimTracker API directly.
+				break
+			}
+		}
+
+		// Directly remove inFlightAllocations for this task's claims using the ClaimTracker API.
+		// This avoids triggering the full DeallocateFunc chain (which would also undo
+		// GPU allocations, VolumeBinding, node assignments, etc.)
+		for i := range task.Pod.Spec.ResourceClaims {
+			claimName := task.Pod.Spec.ResourceClaims[i].Name
+			// Try to resolve the actual claim name from the pod spec
+			claim, err := claimTracker.Get(task.Pod.Namespace, claimName)
+			if err != nil {
+				// Try with generated name pattern
+				continue
+			}
+			if claimTracker.ClaimHasPendingAllocation(types.UID(claim.UID)) {
+				if deleted := claimTracker.RemoveClaimPendingAllocation(types.UID(claim.UID)); deleted {
+					claimTracker.AssumedClaimRestore(claim.Namespace, claim.Name)
+					cleanedCount++
+				}
+			}
+		}
+	}
+
+	if cleanedCount > 0 {
+		klog.V(3).Infof("DRA-LEAK-PREVENTION: Job <%s> is pipelined but not ready, cleaned up %d DRA inFlightAllocations "+
+			"while preserving Pipelined state for reclaim/preempt visibility", job.UID, cleanedCount)
+	}
+}
+
 // String return nodes and jobs information in the session
 func (ssn *Session) String() string {
 	msg := fmt.Sprintf("Session %v: \n", ssn.UID)

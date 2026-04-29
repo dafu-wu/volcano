@@ -446,6 +446,17 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 	} else {
 		if !ssn.JobPipelined(job) {
 			stmt.Discard()
+		} else {
+			// When JobPipelined=true but not Ready, we preserve the Pipelined state
+			// (for reclaim/preempt visibility and event reporting), but we must clean up
+			// DRA inFlightAllocations to prevent leaks across jobs in the same session.
+			//
+			// Without this cleanup, the DRA Reserve plugin's inFlightAllocation entries
+			// persist in the shared DRAManager, causing ListAllAllocatedDevices() to
+			// return false "device in use" results. This makes the DRA Filter incorrectly
+			// report "cannot allocate all claims" for subsequent jobs because it thinks
+			// devices (e.g., channel-0) are occupied when they are not.
+			ssn.CleanupDRAInFlightAllocations(stmt, job)
 		}
 		return nil
 	}

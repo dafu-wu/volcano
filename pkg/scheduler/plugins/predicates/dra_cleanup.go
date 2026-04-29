@@ -25,22 +25,63 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/api"
 )
 
+// pendingAllocationInfo holds diagnostic information about pending (inFlight) allocations.
+type pendingAllocationInfo struct {
+	// total is the total number of claims with pending allocations
+	total int
+	// stale is the number of claims where the pending allocation is stale:
+	// the claim has NO actual allocation in etcd (Status.Allocation == nil),
+	// meaning the inFlightAllocation was leaked from a failed scheduling attempt
+	stale int
+	// staleClaims contains the names of stale claims for diagnostic logging
+	staleClaims []string
+}
+
 // countAllPendingAllocations counts the total number of pending (inFlight) allocations
 // by iterating over all claims in the claimTracker via List().
 // This is used for diagnostic logging to understand the DRA state.
 func countAllPendingAllocations(claimTracker k8sframework.ResourceClaimTracker) int {
+	info := getPendingAllocationInfo(claimTracker)
+	return info.total
+}
+
+// getPendingAllocationInfo returns detailed info about pending allocations,
+// distinguishing between legitimate in-flight allocations and stale ones.
+//
+// A pending allocation is considered "stale" if:
+//   - The claim has an inFlightAllocation entry (ClaimHasPendingAllocation == true)
+//   - BUT the claim's Status.Allocation is nil (not actually allocated in etcd)
+//
+// This means the inFlightAllocation was added during a Reserve() call in a previous
+// scheduling attempt, but was never cleaned up via Unreserve() because the job's
+// statement was not properly discarded (e.g., the JobPipelined=true path).
+//
+// A pending allocation is considered "legitimate" if:
+//   - The claim has an inFlightAllocation entry
+//   - AND the claim's Status.Allocation is non-nil (claim is being bound to etcd)
+//
+// This typically happens during the brief window between Reserve and PreBind completion.
+func getPendingAllocationInfo(claimTracker k8sframework.ResourceClaimTracker) pendingAllocationInfo {
+	info := pendingAllocationInfo{}
 	claims, err := claimTracker.List()
 	if err != nil {
 		klog.V(4).Infof("DRA diagnostic: failed to list claims: %v", err)
-		return -1
+		info.total = -1
+		return info
 	}
-	count := 0
 	for _, claim := range claims {
 		if claimTracker.ClaimHasPendingAllocation(types.UID(claim.UID)) {
-			count++
+			info.total++
+			if claim.Status.Allocation == nil {
+				// Stale: inFlightAllocation exists but claim is NOT allocated in etcd.
+				// This was leaked from a failed scheduling attempt where Reserve() was called
+				// but Unreserve() was never called (e.g., JobPipelined=true without Discard).
+				info.stale++
+				info.staleClaims = append(info.staleClaims, claim.Namespace+"/"+claim.Name)
+			}
 		}
 	}
-	return count
+	return info
 }
 
 // cleanupStaleDRAPendingAllocations removes stale inFlightAllocations from the DRA ResourceClaimTracker.

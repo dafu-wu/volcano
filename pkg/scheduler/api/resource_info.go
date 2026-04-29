@@ -215,6 +215,7 @@ var ignoredScalarResources = sets.NewString(
 // skipped in comparisons like LessEqualWithDimension and IsEmpty.
 var ignoredScalarResourcePrefixes = []string{
 	"nvidia.com/roce_",
+	"nvidia.com/hostdev",
 }
 
 func IsIgnoredScalarResource(name v1.ResourceName) bool {
