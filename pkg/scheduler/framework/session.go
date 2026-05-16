@@ -817,6 +817,11 @@ func (ssn *Session) SweepStaleDRAInFlightAllocations(callsite string) int {
 	}
 
 	cleaned := 0
+	// Track which specific claims were swept so we can surface them in the log
+	// for production diagnostics. We cap the list to avoid log floods (e.g. when
+	// hundreds leak simultaneously).
+	const maxLoggedClaims = 20
+	cleanedClaims := make([]string, 0, maxLoggedClaims)
 	for _, claim := range claims {
 		if !claimTracker.ClaimHasPendingAllocation(types.UID(claim.UID)) {
 			continue
@@ -830,12 +835,26 @@ func (ssn *Session) SweepStaleDRAInFlightAllocations(callsite string) int {
 		if claimTracker.RemoveClaimPendingAllocation(types.UID(claim.UID)) {
 			claimTracker.AssumedClaimRestore(claim.Namespace, claim.Name)
 			cleaned++
+			if len(cleanedClaims) < maxLoggedClaims {
+				cleanedClaims = append(cleanedClaims,
+					fmt.Sprintf("%s/%s(uid=%s)", claim.Namespace, claim.Name, claim.UID))
+			}
 		}
 	}
 
 	if cleaned > 0 {
-		klog.V(3).Infof("DRA-SAFETY-NET (%s): swept %d stale inFlightAllocations (claim.Status.Allocation==nil)",
-			callsite, cleaned)
+		// Surface the actual leaked claim identities so operators can correlate
+		// repeat offenders with specific Jobs / ResourceClaimTemplates.
+		// V(3) is the default operational level for this hotfix branch.
+		if cleaned > maxLoggedClaims {
+			klog.V(3).Infof("DRA-SAFETY-NET (%s): swept %d stale inFlightAllocations "+
+				"(claim.Status.Allocation==nil), first %d shown: %v",
+				callsite, cleaned, maxLoggedClaims, cleanedClaims)
+		} else {
+			klog.V(3).Infof("DRA-SAFETY-NET (%s): swept %d stale inFlightAllocations "+
+				"(claim.Status.Allocation==nil), claims: %v",
+				callsite, cleaned, cleanedClaims)
+		}
 	}
 	return cleaned
 }
