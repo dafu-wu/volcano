@@ -62,6 +62,12 @@ func (alloc *Action) Execute(ssn *framework.Session) {
 	klog.V(5).Infof("Enter Allocate ...")
 	defer klog.V(5).Infof("Leaving Allocate ...")
 
+	// DRA safety net: sweep any stale inFlightAllocations leaked from a previous action
+	// (or a previous session not yet cleaned). This is cheap (O(claims)) and guarantees
+	// that allocate starts with a clean DRA state, regardless of which prior path
+	// (allocate/preempt/reclaim) may have left orphans.
+	ssn.SweepStaleDRAInFlightAllocations("allocate.Execute")
+
 	alloc.parseArguments(ssn)
 
 	// the allocation for pod may have many stages

@@ -45,7 +45,17 @@ func (ra *Action) Initialize() {}
 
 func (ra *Action) Execute(ssn *framework.Session) {
 	klog.V(5).Infof("Enter Reclaim ...")
-	defer klog.V(5).Infof("Leaving Reclaim ...")
+	defer func() {
+		// DRA safety net at action exit: reclaim uses ssn.Pipeline() directly (not via
+		// Statement), so any DRA Reserve() inFlight created during the matching Filter
+		// phase is not tied to a Statement and won't be Unreserved on failure. Sweep
+		// stale entries here to prevent cross-action poisoning.
+		ssn.SweepStaleDRAInFlightAllocations("reclaim.Execute.defer")
+		klog.V(5).Infof("Leaving Reclaim ...")
+	}()
+
+	// DRA safety net at action entry.
+	ssn.SweepStaleDRAInFlightAllocations("reclaim.Execute")
 
 	queues := util.NewPriorityQueue(ssn.QueueOrderFn)
 	queueMap := map[api.QueueID]*api.QueueInfo{}

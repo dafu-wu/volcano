@@ -38,6 +38,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/dynamic-resource-allocation/resourceclaim"
 	"k8s.io/klog/v2"
 	k8sframework "k8s.io/kubernetes/pkg/scheduler/framework"
 
@@ -784,16 +785,83 @@ func (ssn *Session) SharedDRAManager() k8sframework.SharedDRAManager {
 	return ssn.cache.SharedDRAManager()
 }
 
-// CleanupDRAInFlightAllocations cleans up DRA inFlightAllocation entries for tasks
-// in the given statement without discarding the full statement (preserving Pipelined state).
+// SweepStaleDRAInFlightAllocations is the session-wide safety net for DRA inFlightAllocation leaks.
+// It scans the entire claimTracker and removes any inFlightAllocation entry whose claim has
+// Status.Allocation==nil (i.e. there is no record in etcd that the claim is allocated, so the
+// inFlight promise is definitely stale).
 //
-// This is needed when a job is Pipelined but not Ready: we want to keep the Pipelined
-// task state for reclaim/preempt visibility and event reporting, but we must remove
-// the DRA inFlightAllocation entries to prevent leaks across jobs in the same session.
+// This is safe to call at any time and is a no-op when there is no leak. It MUST NOT be confused
+// with CleanupDRAInFlightAllocations, which is per-Job and per-Statement; this function is
+// global and does not require any Job/Statement context.
 //
-// For each task with ResourceClaims in the statement's operations, this method calls
-// DRA Unreserve to remove the inFlightAllocation, without touching the task's status,
-// node assignment, or other non-DRA state.
+// Recommended call sites:
+//   - At session open, before any action runs, to clean leftovers from a previous session.
+//   - At the entry of each action (allocate/preempt/reclaim) as a defensive sweep.
+//   - At session close.
+//
+// Returns the number of entries removed (for diagnostics).
+func (ssn *Session) SweepStaleDRAInFlightAllocations(callsite string) int {
+	draManager := ssn.SharedDRAManager()
+	if draManager == nil {
+		return 0
+	}
+	claimTracker := draManager.ResourceClaims()
+	if claimTracker == nil {
+		return 0
+	}
+
+	claims, err := claimTracker.List()
+	if err != nil {
+		klog.V(4).Infof("DRA-SAFETY-NET (%s): failed to list claims: %v", callsite, err)
+		return 0
+	}
+
+	cleaned := 0
+	for _, claim := range claims {
+		if !claimTracker.ClaimHasPendingAllocation(types.UID(claim.UID)) {
+			continue
+		}
+		// Only remove entries that are CONFIRMED stale: not bound to etcd yet.
+		// Legitimate "being bound to etcd" entries have Status.Allocation != nil and
+		// must NOT be touched (they belong to in-flight PreBind RPCs).
+		if claim.Status.Allocation != nil {
+			continue
+		}
+		if claimTracker.RemoveClaimPendingAllocation(types.UID(claim.UID)) {
+			claimTracker.AssumedClaimRestore(claim.Namespace, claim.Name)
+			cleaned++
+		}
+	}
+
+	if cleaned > 0 {
+		klog.V(3).Infof("DRA-SAFETY-NET (%s): swept %d stale inFlightAllocations (claim.Status.Allocation==nil)",
+			callsite, cleaned)
+	}
+	return cleaned
+}
+
+// CleanupDRAInFlightAllocations removes DRA inFlightAllocation entries that were created during
+// this scheduling attempt for the given job, without discarding the volcano Statement
+// (preserving Pipelined task state for reclaim/preempt visibility).
+//
+// Background:
+//   - DRA Reserve() is called inside predicatesPlugin.AllocateFunc, BEFORE the task is recorded
+//     into Statement.operations via stmt.Allocate()/stmt.Pipeline(). It records an
+//     inFlightAllocation that promises "I will write claim.Status.Allocation into etcd via PreBind".
+//   - When JobReady==false but JobPipelined==true, allocate.go does NOT call stmt.Discard(),
+//     so DRA Unreserve() (which would clean inFlightAllocations) is never invoked.
+//   - DRAManager is a Shared, process-long-lived singleton, so the leaked entries stay forever
+//     until the process restarts. They poison ListAllAllocatedDevices() for subsequent jobs.
+//
+// Correct cleanup must:
+//  1. Iterate ALL tasks of the job (NOT just stmt.Operations(), because:
+//     - tasks that triggered Reserve but failed later won't be in operations
+//     - operations only contains successful Allocate/Pipeline calls)
+//  2. Resolve the real ResourceClaim name from the pod via resourceclaim.Name(), because
+//     pod.Spec.ResourceClaims[i].Name is only a per-pod alias.
+//  3. As a session-wide safety net, also sweep any inFlight entry whose claim has
+//     Status.Allocation==nil (definitely stale). This catches leaks from earlier jobs in the
+//     same session whose CleanupDRAInFlightAllocations call missed them.
 func (ssn *Session) CleanupDRAInFlightAllocations(stmt *Statement, job *api.JobInfo) {
 	draManager := ssn.SharedDRAManager()
 	if draManager == nil {
@@ -804,55 +872,71 @@ func (ssn *Session) CleanupDRAInFlightAllocations(stmt *Statement, job *api.JobI
 		return
 	}
 
-	cleanedCount := 0
-	for _, op := range stmt.Operations() {
-		task := op.task
-		if task == nil || task.Pod == nil || len(task.Pod.Spec.ResourceClaims) == 0 {
+	// Track which claim UIDs we already cleaned to avoid double counting in the safety-net pass.
+	cleaned := make(map[types.UID]struct{})
+
+	// (1) Per-task pass: walk every task in the job and resolve real claim names.
+	//     This is the precise, intent-matching cleanup.
+	cleanedPerTask := 0
+	for _, task := range job.Tasks {
+		pod := task.Pod
+		if pod == nil || len(pod.Spec.ResourceClaims) == 0 {
 			continue
 		}
-
-		state := ssn.GetCycleState(task.UID)
-		if state == nil {
-			continue
-		}
-
-		// Trigger DRA Unreserve via the event handler chain by firing a targeted
-		// DeallocateFunc for this task. However, we DON'T want to actually deallocate
-		// the task (remove from node, change status to Pending, etc.).
-		// Instead, we directly call the DRA plugin's Unreserve if available.
-		for _, eh := range ssn.eventHandlers {
-			if eh.DeallocateFunc != nil {
-				// We need a way to only call DRA Unreserve without the full deallocation.
-				// Since the event handler chain does GPU release, VolumeBinding Unreserve, etc.
-				// in addition to DRA Unreserve, we can't use DeallocateFunc directly.
-				// Instead, we'll use the ClaimTracker API directly.
-				break
-			}
-		}
-
-		// Directly remove inFlightAllocations for this task's claims using the ClaimTracker API.
-		// This avoids triggering the full DeallocateFunc chain (which would also undo
-		// GPU allocations, VolumeBinding, node assignments, etc.)
-		for i := range task.Pod.Spec.ResourceClaims {
-			claimName := task.Pod.Spec.ResourceClaims[i].Name
-			// Try to resolve the actual claim name from the pod spec
-			claim, err := claimTracker.Get(task.Pod.Namespace, claimName)
-			if err != nil {
-				// Try with generated name pattern
+		for i := range pod.Spec.ResourceClaims {
+			// Resolve the actual ResourceClaim name:
+			//   - For direct claims: returns pod.Spec.ResourceClaims[i].ResourceClaimName
+			//   - For templates:     returns pod.Status.ResourceClaimStatuses[i].ResourceClaimName
+			//     (generated as "<pod>-<claim-alias>-<hash>")
+			realName, _, err := resourceclaim.Name(pod, &pod.Spec.ResourceClaims[i])
+			if err != nil || realName == nil {
 				continue
 			}
-			if claimTracker.ClaimHasPendingAllocation(types.UID(claim.UID)) {
-				if deleted := claimTracker.RemoveClaimPendingAllocation(types.UID(claim.UID)); deleted {
-					claimTracker.AssumedClaimRestore(claim.Namespace, claim.Name)
-					cleanedCount++
-				}
+			claim, err := claimTracker.Get(pod.Namespace, *realName)
+			if err != nil {
+				continue
+			}
+			if !claimTracker.ClaimHasPendingAllocation(types.UID(claim.UID)) {
+				continue
+			}
+			if claimTracker.RemoveClaimPendingAllocation(types.UID(claim.UID)) {
+				claimTracker.AssumedClaimRestore(claim.Namespace, claim.Name)
+				cleaned[types.UID(claim.UID)] = struct{}{}
+				cleanedPerTask++
 			}
 		}
 	}
 
-	if cleanedCount > 0 {
-		klog.V(3).Infof("DRA-LEAK-PREVENTION: Job <%s> is pipelined but not ready, cleaned up %d DRA inFlightAllocations "+
-			"while preserving Pipelined state for reclaim/preempt visibility", job.UID, cleanedCount)
+	// (2) Safety-net pass: scan all claims; remove any inFlight entry where the claim
+	//     has Status.Allocation==nil (definitely stale, regardless of which job owns it).
+	//     This handles leaks from earlier jobs in this session that we may have missed
+	//     (e.g. claim renamed, pod deleted but claim retained, multi-statement edge cases).
+	cleanedSweep := 0
+	if claims, err := claimTracker.List(); err == nil {
+		for _, claim := range claims {
+			if _, already := cleaned[types.UID(claim.UID)]; already {
+				continue
+			}
+			if !claimTracker.ClaimHasPendingAllocation(types.UID(claim.UID)) {
+				continue
+			}
+			// Only remove entries that are CONFIRMED stale: not bound to etcd yet.
+			// Legitimate "being bound to etcd" entries have Status.Allocation != nil and
+			// must NOT be touched (they belong to in-flight PreBind RPCs).
+			if claim.Status.Allocation != nil {
+				continue
+			}
+			if claimTracker.RemoveClaimPendingAllocation(types.UID(claim.UID)) {
+				claimTracker.AssumedClaimRestore(claim.Namespace, claim.Name)
+				cleanedSweep++
+			}
+		}
+	}
+
+	if cleanedPerTask > 0 || cleanedSweep > 0 {
+		klog.V(3).Infof("DRA-LEAK-PREVENTION: Job <%s> pipelined-but-not-ready, "+
+			"cleaned %d inFlightAllocations from this job's tasks + %d stale leftovers from prior jobs in this session",
+			job.UID, cleanedPerTask, cleanedSweep)
 	}
 }
 

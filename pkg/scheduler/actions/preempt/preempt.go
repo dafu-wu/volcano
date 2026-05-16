@@ -101,7 +101,18 @@ func (pmpt *Action) parseArguments(ssn *framework.Session) {
 
 func (pmpt *Action) Execute(ssn *framework.Session) {
 	klog.V(5).Infof("Enter Preempt ...")
-	defer klog.V(5).Infof("Leaving Preempt ...")
+	defer func() {
+		// DRA safety net at action exit: preempt's stmt.Commit() preserves Pipelined
+		// state for the preemptor; the matching DRA Reserve() inFlightAllocations are
+		// expected to be converted by PreBind in a later session. If for any reason
+		// the preemptor is later un-pipelined or the PreBind never runs, the inFlight
+		// entries would leak. Sweep stale entries at exit as a safety net.
+		ssn.SweepStaleDRAInFlightAllocations("preempt.Execute.defer")
+		klog.V(5).Infof("Leaving Preempt ...")
+	}()
+
+	// DRA safety net at action entry.
+	ssn.SweepStaleDRAInFlightAllocations("preempt.Execute")
 
 	pmpt.parseArguments(ssn)
 
