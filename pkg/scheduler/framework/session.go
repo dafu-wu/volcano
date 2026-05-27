@@ -479,7 +479,12 @@ func (ssn *Session) PredicateForPreemptAction(task *api.TaskInfo, node *api.Node
 	// When filtering candidate nodes, need to consider the node statusSets instead of the err information.
 	// refer to kube-scheduler preemption code: https://github.com/kubernetes/kubernetes/blob/9d87fa215d9e8020abdc17132d1252536cd752d2/pkg/scheduler/framework/preemption/preemption.go#L422
 	statusSets := fitError.Status
-	if statusSets.ContainsUnschedulableAndUnresolvable() || statusSets.ContainsErrorSkipOrWait() {
+	if statusSets.ContainsDRAClaimAllocationFailure() && !statusSets.ContainsPreemptActionFatalStatus() {
+		klog.V(4).Infof("Treat DRA claim allocation failure as preempt/reclaim resolvable for task %s/%s on node %s: %v",
+			task.Namespace, task.Name, node.Name, fitError)
+		return nil
+	}
+	if statusSets.ContainsPreemptActionFatalStatus() {
 		return fitError
 	}
 	return nil

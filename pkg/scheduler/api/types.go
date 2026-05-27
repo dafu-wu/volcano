@@ -238,6 +238,29 @@ func (s StatusSets) ContainsUnschedulableAndUnresolvable() bool {
 	return false
 }
 
+// ContainsUnschedulableAndUnresolvableForPreemptAction reports whether the
+// status set contains a fatal unresolvable reason for preempt/reclaim.
+//
+// DynamicResources "cannot allocate all claims" is intentionally treated like
+// ordinary Unschedulable here: in preempt/reclaim, claims can fail allocation
+// only because devices are still held by victims in the current node snapshot.
+// After those victims are removed, the same claim allocation may become valid.
+func (s StatusSets) ContainsUnschedulableAndUnresolvableForPreemptAction() bool {
+	for _, status := range s {
+		if status == nil {
+			continue
+		}
+		if status.Code != UnschedulableAndUnresolvable {
+			continue
+		}
+		if isDRAClaimAllocationFailure(status) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func (s StatusSets) ContainsErrorSkipOrWait() bool {
 	for _, status := range s {
 		if status == nil {
@@ -248,6 +271,28 @@ func (s StatusSets) ContainsErrorSkipOrWait() bool {
 		}
 	}
 	return false
+}
+
+// ContainsPreemptActionFatalStatus reports whether any status should abort
+// preempt/reclaim before victim selection.
+func (s StatusSets) ContainsPreemptActionFatalStatus() bool {
+	return s.ContainsUnschedulableAndUnresolvableForPreemptAction() || s.ContainsErrorSkipOrWait()
+}
+
+func (s StatusSets) ContainsDRAClaimAllocationFailure() bool {
+	for _, status := range s {
+		if isDRAClaimAllocationFailure(status) {
+			return true
+		}
+	}
+	return false
+}
+
+func isDRAClaimAllocationFailure(status *Status) bool {
+	return status != nil &&
+		status.Code == UnschedulableAndUnresolvable &&
+		status.Plugin == "DynamicResources" &&
+		strings.Contains(status.Reason, "cannot allocate all claims")
 }
 
 // Message return the message generated from StatusSets

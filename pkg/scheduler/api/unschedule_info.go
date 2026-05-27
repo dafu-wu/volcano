@@ -89,7 +89,7 @@ func (f *FitErrors) SetNodeError(nodeName string, err error) {
 func (f *FitErrors) GetUnschedulableAndUnresolvableNodes() map[string]sets.Empty {
 	ret := make(map[string]sets.Empty)
 	for _, node := range f.nodes {
-		if node.Status.ContainsUnschedulableAndUnresolvable() {
+		if node.Status.ContainsUnschedulableAndUnresolvableForPreemptAction() {
 			ret[node.NodeName] = sets.Empty{}
 		}
 	}
