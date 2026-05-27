@@ -260,27 +260,34 @@ func (pp *predicatesPlugin) OnSessionOpen(ssn *framework.Session) {
 				klog.Errorf("predicates, update pod %s/%s allocate to NOT EXIST node [%s]", pod.Namespace, pod.Name, nodeName)
 				return
 			}
-			nodeInfo, ok := ssn.Nodes[nodeName]
-			if !ok {
-				klog.Errorf("Failed to get node %s info from cache", nodeName)
-				return
-			}
-			// run reserve plugins
-			pp.runReservePlugins(ssn, event)
-			//predicate gpu sharing
-			for _, val := range api.RegisteredDevices {
-				if devices, ok := nodeInfo.Others[val].(api.Devices); ok {
-					if !devices.HasDeviceRequest(pod) {
-						continue
-					}
+			if event.ExternalResources {
+				nodeInfo, ok := ssn.Nodes[nodeName]
+				if !ok {
+					event.Err = fmt.Errorf("failed to get node %s info from cache", nodeName)
+					klog.Errorf("%v", event.Err)
+					return
+				}
+				// run reserve plugins
+				pp.runReservePlugins(ssn, event)
+				if event.Err != nil {
+					return
+				}
+				//predicate gpu sharing
+				for _, val := range api.RegisteredDevices {
+					if devices, ok := nodeInfo.Others[val].(api.Devices); ok {
+						if !devices.HasDeviceRequest(pod) {
+							continue
+						}
 
-					err := devices.Allocate(ssn.KubeClient(), pod)
-					if err != nil {
-						klog.Errorf("AllocateToPod failed %s", err.Error())
-						return
+						err := devices.Allocate(ssn.KubeClient(), pod)
+						if err != nil {
+							event.Err = err
+							klog.Errorf("AllocateToPod failed %s", err.Error())
+							return
+						}
+					} else {
+						klog.Warningf("Devices %s assertion conversion failed, skip", val)
 					}
-				} else {
-					klog.Warningf("Devices %s assertion conversion failed, skip", val)
 				}
 			}
 			node.AddPod(pod)
@@ -296,34 +303,42 @@ func (pp *predicatesPlugin) OnSessionOpen(ssn *framework.Session) {
 				return
 			}
 
-			nodeInfo, ok := ssn.Nodes[nodeName]
-			if !ok {
-				klog.Errorf("Failed to get node %s info from cache", nodeName)
-				return
-			}
+			if event.ExternalResources {
+				nodeInfo, ok := ssn.Nodes[nodeName]
+				if !ok {
+					event.Err = fmt.Errorf("failed to get node %s info from cache", nodeName)
+					klog.Errorf("%v", event.Err)
+					return
+				}
 
-			// run unReserve plugins
-			pp.runUnReservePlugins(ssn, event)
+				// run unReserve plugins
+				pp.runUnReservePlugins(ssn, event)
+				if event.Err != nil {
+					return
+				}
 
-			for _, val := range api.RegisteredDevices {
-				if devices, ok := nodeInfo.Others[val].(api.Devices); ok {
-					if !devices.HasDeviceRequest(pod) {
-						continue
+				for _, val := range api.RegisteredDevices {
+					if devices, ok := nodeInfo.Others[val].(api.Devices); ok {
+						if !devices.HasDeviceRequest(pod) {
+							continue
+						}
+
+						// deallocate pod gpu id
+						err := devices.Release(ssn.KubeClient(), pod)
+						if err != nil {
+							event.Err = err
+							klog.Errorf("Device %s release failed for pod %s/%s, err:%s", val, pod.Namespace, pod.Name, err.Error())
+							return
+						}
+					} else {
+						klog.Warningf("Devices %s assertion conversion failed, skip", val)
 					}
-
-					// deallocate pod gpu id
-					err := devices.Release(ssn.KubeClient(), pod)
-					if err != nil {
-						klog.Errorf("Device %s release failed for pod %s/%s, err:%s", val, pod.Namespace, pod.Name, err.Error())
-						return
-					}
-				} else {
-					klog.Warningf("Devices %s assertion conversion failed, skip", val)
 				}
 			}
 
 			err := node.RemovePod(klog.FromContext(context.TODO()), pod)
 			if err != nil {
+				event.Err = err
 				klog.Errorf("predicates, remove pod %s/%s from node [%s] error: %v", pod.Namespace, pod.Name, nodeName, err)
 				return
 			}

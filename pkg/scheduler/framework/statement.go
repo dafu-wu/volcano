@@ -94,7 +94,9 @@ func (s *Statement) Evict(reclaimee *api.TaskInfo, reason string) error {
 	for _, eh := range s.ssn.eventHandlers {
 		if eh.DeallocateFunc != nil {
 			eh.DeallocateFunc(&Event{
-				Task: reclaimee,
+				Task:              reclaimee,
+				Operation:         EventDeallocate,
+				ExternalResources: true,
 			})
 		}
 	}
@@ -145,7 +147,9 @@ func (s *Statement) unevict(reclaimee *api.TaskInfo) error {
 	for _, eh := range s.ssn.eventHandlers {
 		if eh.AllocateFunc != nil {
 			eh.AllocateFunc(&Event{
-				Task: reclaimee,
+				Task:              reclaimee,
+				Operation:         EventAllocate,
+				ExternalResources: true,
 			})
 		}
 	}
@@ -191,7 +195,9 @@ func (s *Statement) Pipeline(task *api.TaskInfo, hostname string, evictionOccurr
 	for _, eh := range s.ssn.eventHandlers {
 		if eh.AllocateFunc != nil {
 			eventInfo := &Event{
-				Task: task,
+				Task:              task,
+				Operation:         EventPipeline,
+				ExternalResources: false,
 			}
 			eh.AllocateFunc(eventInfo)
 			if eventInfo.Err != nil {
@@ -244,7 +250,9 @@ func (s *Statement) UnPipeline(task *api.TaskInfo) error {
 	for _, eh := range s.ssn.eventHandlers {
 		if eh.DeallocateFunc != nil {
 			eventInfo := &Event{
-				Task: task,
+				Task:              task,
+				Operation:         EventUnPipeline,
+				ExternalResources: false,
 			}
 			eh.DeallocateFunc(eventInfo)
 			if eventInfo.Err != nil {
@@ -300,7 +308,9 @@ func (s *Statement) Allocate(task *api.TaskInfo, nodeInfo *api.NodeInfo) (err er
 	for _, eh := range s.ssn.eventHandlers {
 		if eh.AllocateFunc != nil {
 			eventInfo := &Event{
-				Task: task,
+				Task:              task,
+				Operation:         EventAllocate,
+				ExternalResources: true,
 			}
 			eh.AllocateFunc(eventInfo)
 			if eventInfo.Err != nil {
@@ -378,7 +388,9 @@ func (s *Statement) unallocate(task *api.TaskInfo) error {
 	for _, eh := range s.ssn.eventHandlers {
 		if eh.DeallocateFunc != nil {
 			eh.DeallocateFunc(&Event{
-				Task: task,
+				Task:              task,
+				Operation:         EventDeallocate,
+				ExternalResources: true,
 			})
 		}
 	}

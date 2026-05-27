@@ -63,7 +63,12 @@ type queueAttr struct {
 
 	deserved  *api.Resource
 	allocated *api.Resource
-	request   *api.Resource
+	// pipelined tracks scheduler-internal reservations against releasing resources.
+	// These reservations must participate in quota decisions, but must not be
+	// reported or reclaimed as real allocated resources.
+	pipelined    *api.Resource
+	pipelinedJob map[api.JobID]*api.Resource
+	request      *api.Resource
 	// elastic represents the sum of job's elastic resource, job's elastic = job.allocated - job.minAvailable
 	elastic *api.Resource
 	// inqueue represents the resource request of the inqueue job
@@ -159,13 +164,14 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 		}
 		attr := cp.queueOpts[queue.UID]
 
-		futureUsed := attr.allocated.Clone().Add(task.Resreq)
+		currentUsed := attr.used()
+		futureUsed := currentUsed.Clone().Add(task.Resreq)
 		overused := !futureUsed.LessEqualWithDimension(attr.deserved, task.Resreq)
 		metrics.UpdateQueueOverused(attr.name, overused)
 		if overused {
 			klog.V(3).Infof("Queue <%v> cannot reclaim: queue would exceed deserved resources after allocation", queue.Name)
 			klog.V(3).Infof("  Task <%s/%s> resource request: %v", task.Namespace, task.Name, task.Resreq)
-			klog.V(3).Infof("  Queue <%v> deserved: %v, allocated: %v, share: %.2f", queue.Name, attr.deserved, attr.allocated, attr.share)
+			klog.V(3).Infof("  Queue <%v> deserved: %v, allocated: %v, pipelined: %v, used: %v, share: %.2f", queue.Name, attr.deserved, attr.allocated, attr.pipelined, currentUsed, attr.share)
 			klog.V(3).Infof("  Future usage after allocation: %v", futureUsed)
 
 			// Check which resource dimension exceeds deserved
@@ -357,36 +363,52 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 		AllocateFunc: func(event *framework.Event) {
 			job := ssn.Jobs[event.Task.Job]
 			attr := cp.queueOpts[job.Queue]
-			attr.allocated.Add(event.Task.Resreq)
-			metrics.UpdateQueueAllocated(attr.name, attr.allocated.MilliCPU, attr.allocated.Memory, attr.allocated.ScalarResources)
-
+			if event.Operation == framework.EventPipeline {
+				attr.addPipelined(event.Task.Job, event.Task.Resreq)
+			} else {
+				attr.allocated.Add(event.Task.Resreq)
+				metrics.UpdateQueueAllocated(attr.name, attr.allocated.MilliCPU, attr.allocated.Memory, attr.allocated.ScalarResources)
+			}
 			cp.updateShare(attr)
 			if hierarchyEnabled {
 				for _, ancestorID := range attr.ancestors {
 					ancestorAttr := cp.queueOpts[ancestorID]
-					ancestorAttr.allocated.Add(event.Task.Resreq)
+					if event.Operation == framework.EventPipeline {
+						ancestorAttr.addPipelined(event.Task.Job, event.Task.Resreq)
+					} else {
+						ancestorAttr.allocated.Add(event.Task.Resreq)
+					}
+					cp.updateShare(ancestorAttr)
 				}
 			}
 
-			klog.V(4).Infof("Capacity AllocateFunc: task <%v/%v>, resreq <%v>,  share <%v>",
-				event.Task.Namespace, event.Task.Name, event.Task.Resreq, attr.share)
+			klog.V(4).Infof("Capacity AllocateFunc: task <%v/%v>, operation <%s>, resreq <%v>, allocated <%v>, pipelined <%v>, share <%v>",
+				event.Task.Namespace, event.Task.Name, event.Operation, event.Task.Resreq, attr.allocated, attr.pipelined, attr.share)
 		},
 		DeallocateFunc: func(event *framework.Event) {
 			job := ssn.Jobs[event.Task.Job]
 			attr := cp.queueOpts[job.Queue]
-			attr.allocated.Sub(event.Task.Resreq)
-			metrics.UpdateQueueAllocated(attr.name, attr.allocated.MilliCPU, attr.allocated.Memory, attr.allocated.ScalarResources)
-
+			if event.Operation == framework.EventUnPipeline {
+				attr.subPipelined(event.Task.Job, event.Task.Resreq)
+			} else {
+				attr.allocated.Sub(event.Task.Resreq)
+				metrics.UpdateQueueAllocated(attr.name, attr.allocated.MilliCPU, attr.allocated.Memory, attr.allocated.ScalarResources)
+			}
 			cp.updateShare(attr)
 			if hierarchyEnabled {
 				for _, ancestorID := range attr.ancestors {
 					ancestorAttr := cp.queueOpts[ancestorID]
-					ancestorAttr.allocated.Sub(event.Task.Resreq)
+					if event.Operation == framework.EventUnPipeline {
+						ancestorAttr.subPipelined(event.Task.Job, event.Task.Resreq)
+					} else {
+						ancestorAttr.allocated.Sub(event.Task.Resreq)
+					}
+					cp.updateShare(ancestorAttr)
 				}
 			}
 
-			klog.V(4).Infof("Capacity EvictFunc: task <%v/%v>, resreq <%v>,  share <%v>",
-				event.Task.Namespace, event.Task.Name, event.Task.Resreq, attr.share)
+			klog.V(4).Infof("Capacity EvictFunc: task <%v/%v>, operation <%s>, resreq <%v>, allocated <%v>, pipelined <%v>, share <%v>",
+				event.Task.Namespace, event.Task.Name, event.Operation, event.Task.Resreq, attr.allocated, attr.pipelined, attr.share)
 		},
 	})
 }
@@ -415,12 +437,14 @@ func (cp *capacityPlugin) buildQueueAttrs(ssn *framework.Session) {
 				queueID: queue.UID,
 				name:    queue.Name,
 
-				deserved:  api.NewResource(queue.Queue.Spec.Deserved),
-				allocated: api.EmptyResource(),
-				request:   api.EmptyResource(),
-				elastic:   api.EmptyResource(),
-				inqueue:   api.EmptyResource(),
-				guarantee: api.EmptyResource(),
+				deserved:     api.NewResource(queue.Queue.Spec.Deserved),
+				allocated:    api.EmptyResource(),
+				pipelined:    api.EmptyResource(),
+				pipelinedJob: map[api.JobID]*api.Resource{},
+				request:      api.EmptyResource(),
+				elastic:      api.EmptyResource(),
+				inqueue:      api.EmptyResource(),
+				guarantee:    api.EmptyResource(),
 			}
 			if len(queue.Queue.Spec.Capability) != 0 {
 				attr.capability = api.NewResource(queue.Queue.Spec.Capability)
@@ -476,8 +500,8 @@ func (cp *capacityPlugin) buildQueueAttrs(ssn *framework.Session) {
 			attr.inqueue.Add(job.DeductSchGatedResources(inqueued))
 		}
 		attr.elastic.Add(job.GetElasticResources())
-		klog.V(5).Infof("Queue %s allocated <%s> request <%s> inqueue <%s> elastic <%s>",
-			attr.name, attr.allocated.String(), attr.request.String(), attr.inqueue.String(), attr.elastic.String())
+		klog.V(5).Infof("Queue %s allocated <%s> pipelined <%s> request <%s> inqueue <%s> elastic <%s>",
+			attr.name, attr.allocated.String(), attr.pipelined.String(), attr.request.String(), attr.inqueue.String(), attr.elastic.String())
 	}
 
 	for _, attr := range cp.queueOpts {
@@ -487,8 +511,8 @@ func (cp *capacityPlugin) buildQueueAttrs(ssn *framework.Session) {
 
 		attr.deserved = helpers.Max(attr.deserved, attr.guarantee)
 		cp.updateShare(attr)
-		klog.V(4).Infof("The attributes of queue <%s> in capacity: deserved <%v>, realCapability <%v>, allocate <%v>, request <%v>, elastic <%v>, share <%0.2f>",
-			attr.name, attr.deserved, attr.realCapability, attr.allocated, attr.request, attr.elastic, attr.share)
+		klog.V(4).Infof("The attributes of queue <%s> in capacity: deserved <%v>, realCapability <%v>, allocate <%v>, pipelined <%v>, request <%v>, elastic <%v>, share <%0.2f>",
+			attr.name, attr.deserved, attr.realCapability, attr.allocated, attr.pipelined, attr.request, attr.elastic, attr.share)
 	}
 
 	// Record metrics
@@ -617,8 +641,8 @@ func (cp *capacityPlugin) buildHierarchicalQueueAttrs(ssn *framework.Session) bo
 			ancestorAttr.elastic.Add(attr.elastic.Clone().Sub(oldElastic))
 		}
 
-		klog.V(5).Infof("Queue %s allocated <%s> request <%s> inqueue <%s> elastic <%s>",
-			attr.name, attr.allocated.String(), attr.request.String(), attr.inqueue.String(), attr.elastic.String())
+		klog.V(5).Infof("Queue %s allocated <%s> pipelined <%s> request <%s> inqueue <%s> elastic <%s>",
+			attr.name, attr.allocated.String(), attr.pipelined.String(), attr.request.String(), attr.inqueue.String(), attr.elastic.String())
 	}
 
 	// init root queue: realCapability is set to total resource, and capability/deserved are also set if empty.
@@ -645,8 +669,8 @@ func (cp *capacityPlugin) buildHierarchicalQueueAttrs(ssn *framework.Session) bo
 	// Update share
 	for _, attr := range cp.queueOpts {
 		cp.updateShare(attr)
-		klog.V(4).Infof("The attributes of queue <%s> in capacity: deserved <%v>, realCapability <%v>, allocate <%v>, request <%v>, elastic <%v>, share <%0.2f>",
-			attr.name, attr.deserved, attr.realCapability, attr.allocated, attr.request, attr.elastic, attr.share)
+		klog.V(4).Infof("The attributes of queue <%s> in capacity: deserved <%v>, realCapability <%v>, allocate <%v>, pipelined <%v>, request <%v>, elastic <%v>, share <%0.2f>",
+			attr.name, attr.deserved, attr.realCapability, attr.allocated, attr.pipelined, attr.request, attr.elastic, attr.share)
 	}
 
 	// Record metrics
@@ -740,6 +764,8 @@ func (cp *capacityPlugin) newQueueAttr(queue *api.QueueInfo) *queueAttr {
 
 		deserved:       api.NewResource(queue.Queue.Spec.Deserved),
 		allocated:      api.EmptyResource(),
+		pipelined:      api.EmptyResource(),
+		pipelinedJob:   map[api.JobID]*api.Resource{},
 		request:        api.EmptyResource(),
 		elastic:        api.EmptyResource(),
 		inqueue:        api.EmptyResource(),
@@ -868,6 +894,56 @@ func (cp *capacityPlugin) updateShare(attr *queueAttr) {
 	metrics.UpdateQueueShare(attr.name, attr.share)
 }
 
+func (qa *queueAttr) used() *api.Resource {
+	used := api.EmptyResource()
+	if qa == nil {
+		return used
+	}
+	if qa.allocated != nil {
+		used.Add(qa.allocated)
+	}
+	if qa.pipelined != nil {
+		used.Add(qa.pipelined)
+	}
+	return used
+}
+
+func (qa *queueAttr) addPipelined(jobID api.JobID, res *api.Resource) {
+	if qa.pipelined == nil {
+		qa.pipelined = api.EmptyResource()
+	}
+	if qa.pipelinedJob == nil {
+		qa.pipelinedJob = map[api.JobID]*api.Resource{}
+	}
+	qa.pipelined.Add(res)
+	if _, ok := qa.pipelinedJob[jobID]; !ok {
+		qa.pipelinedJob[jobID] = api.EmptyResource()
+	}
+	qa.pipelinedJob[jobID].Add(res)
+}
+
+func (qa *queueAttr) subPipelined(jobID api.JobID, res *api.Resource) {
+	if qa.pipelined == nil || !res.LessEqual(qa.pipelined, api.Zero) {
+		klog.Warningf("capacity: unpipeline resource <%v> exceeds tracked pipelined resource <%v> for job <%s>", res, qa.pipelined, jobID)
+		qa.pipelined = api.EmptyResource()
+		delete(qa.pipelinedJob, jobID)
+		return
+	}
+
+	qa.pipelined.Sub(res)
+	if jobRes, ok := qa.pipelinedJob[jobID]; ok {
+		if res.LessEqual(jobRes, api.Zero) {
+			jobRes.Sub(res)
+			if jobRes.IsEmpty() {
+				delete(qa.pipelinedJob, jobID)
+			}
+		} else {
+			klog.Warningf("capacity: unpipeline resource <%v> exceeds tracked pipelined resource <%v> for job <%s>", res, jobRes, jobID)
+			delete(qa.pipelinedJob, jobID)
+		}
+	}
+}
+
 func (cp *capacityPlugin) isLeafQueue(queueID api.QueueID) bool {
 	return len(cp.queueOpts[queueID].children) == 0
 }
@@ -878,11 +954,12 @@ func (cp *capacityPlugin) queueAllocatable(queue *api.QueueInfo, candidate *api.
 }
 
 func queueAllocatable(attr *queueAttr, candidate *api.TaskInfo, queue *api.QueueInfo) bool {
-	futureUsed := attr.allocated.Clone().Add(candidate.Resreq)
+	currentUsed := attr.used()
+	futureUsed := currentUsed.Clone().Add(candidate.Resreq)
 	allocatable := futureUsed.LessEqualWithDimension(attr.realCapability, candidate.Resreq)
 	if !allocatable {
-		klog.V(3).Infof("Queue <%v>: realCapability <%v>, allocated <%v>; Candidate <%v>: resource request <%v>",
-			queue.Name, attr.realCapability, attr.allocated, candidate.Name, candidate.Resreq)
+		klog.V(3).Infof("Queue <%v>: realCapability <%v>, allocated <%v>, pipelined <%v>, used <%v>; Candidate <%v>: resource request <%v>",
+			queue.Name, attr.realCapability, attr.allocated, attr.pipelined, currentUsed, candidate.Name, candidate.Resreq)
 	}
 
 	return allocatable
@@ -910,10 +987,10 @@ func (cp *capacityPlugin) jobEnqueueable(queue *api.QueueInfo, job *api.JobInfo)
 	attr := cp.queueOpts[queue.UID]
 	minReq := job.GetMinResources()
 
-	klog.V(5).Infof("job %s min resource <%s>, queue %s capability <%s> allocated <%s> inqueue <%s> elastic <%s>",
-		job.Name, minReq.String(), queue.Name, attr.realCapability.String(), attr.allocated.String(), attr.inqueue.String(), attr.elastic.String())
+	klog.V(5).Infof("job %s min resource <%s>, queue %s capability <%s> allocated <%s> pipelined <%s> inqueue <%s> elastic <%s>",
+		job.Name, minReq.String(), queue.Name, attr.realCapability.String(), attr.allocated.String(), attr.pipelined.String(), attr.inqueue.String(), attr.elastic.String())
 	// The queue resource quota limit has not reached
-	r := minReq.Clone().Add(attr.allocated).Add(attr.inqueue).Sub(attr.elastic)
+	r := minReq.Clone().Add(attr.used()).Add(attr.inqueue).Sub(attr.elastic)
 
 	return r.LessEqualWithDimension(attr.realCapability, minReq)
 }
@@ -981,6 +1058,8 @@ func (qa *queueAttr) Clone() *queueAttr {
 		share:          qa.share,
 		deserved:       qa.deserved.Clone(),
 		allocated:      qa.allocated.Clone(),
+		pipelined:      qa.pipelined.Clone(),
+		pipelinedJob:   make(map[api.JobID]*api.Resource, len(qa.pipelinedJob)),
 		request:        qa.request.Clone(),
 		elastic:        qa.elastic.Clone(),
 		inqueue:        qa.inqueue.Clone(),
@@ -997,6 +1076,9 @@ func (qa *queueAttr) Clone() *queueAttr {
 
 	for childID, childNode := range qa.children {
 		cloned.children[childID] = childNode.Clone()
+	}
+	for jobID, res := range qa.pipelinedJob {
+		cloned.pipelinedJob[jobID] = res.Clone()
 	}
 
 	return cloned
@@ -1020,9 +1102,10 @@ func (s *capacityState) Clone() k8sframework.StateData {
 
 func updateQueueAttrShare(attr *queueAttr) {
 	res := float64(0)
+	used := attr.used()
 
 	for _, rn := range attr.deserved.ResourceNames() {
-		res = max(res, helpers.Share(attr.allocated.Get(rn), attr.deserved.Get(rn)))
+		res = max(res, helpers.Share(used.Get(rn), attr.deserved.Get(rn)))
 	}
 
 	attr.share = res

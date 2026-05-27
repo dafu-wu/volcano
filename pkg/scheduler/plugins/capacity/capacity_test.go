@@ -43,6 +43,72 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+func TestQueueAttrPipelinedReservationsAreSeparateFromAllocated(t *testing.T) {
+	gpu := func(value string) *api.Resource {
+		return api.NewResource(api.BuildResourceList("", "", api.ScalarResource{Name: "nvidia.com/gpu", Value: value}))
+	}
+	task := func(name string, value string) *api.TaskInfo {
+		return &api.TaskInfo{
+			Name:   name,
+			Job:    api.JobID("ns/job-a"),
+			Resreq: gpu(value),
+		}
+	}
+
+	attr := &queueAttr{
+		name:           "q1",
+		deserved:       gpu("8"),
+		allocated:      gpu("4"),
+		pipelined:      api.EmptyResource(),
+		pipelinedJob:   map[api.JobID]*api.Resource{},
+		realCapability: gpu("8"),
+	}
+	queue := &api.QueueInfo{Name: "q1"}
+
+	first := task("first", "2")
+	second := task("second", "2")
+	third := task("third", "1")
+
+	attr.addPipelined(first.Job, first.Resreq)
+	updateQueueAttrShare(attr)
+
+	if got := attr.allocated.Get("nvidia.com/gpu"); got != 4000 {
+		t.Fatalf("allocated GPU = %v, want 4000", got)
+	}
+	if got := attr.pipelined.Get("nvidia.com/gpu"); got != 2000 {
+		t.Fatalf("pipelined GPU = %v, want 2000", got)
+	}
+	if got := attr.used().Get("nvidia.com/gpu"); got != 6000 {
+		t.Fatalf("used GPU = %v, want 6000", got)
+	}
+	if !queueAllocatable(attr, second, queue) {
+		t.Fatalf("second task should fit: allocated 4 + pipelined 2 + request 2 <= capability 8")
+	}
+
+	attr.addPipelined(second.Job, second.Resreq)
+	updateQueueAttrShare(attr)
+
+	if got := attr.allocated.Get("nvidia.com/gpu"); got != 4000 {
+		t.Fatalf("allocated GPU after second pipeline = %v, want 4000", got)
+	}
+	if got := attr.used().Get("nvidia.com/gpu"); got != 8000 {
+		t.Fatalf("used GPU after second pipeline = %v, want 8000", got)
+	}
+	if queueAllocatable(attr, third, queue) {
+		t.Fatalf("third task should not fit: allocated 4 + pipelined 4 + request 1 > capability 8")
+	}
+
+	attr.subPipelined(first.Job, first.Resreq)
+	updateQueueAttrShare(attr)
+
+	if got := attr.used().Get("nvidia.com/gpu"); got != 6000 {
+		t.Fatalf("used GPU after unpipeline = %v, want 6000", got)
+	}
+	if got := attr.allocated.Get("nvidia.com/gpu"); got != 4000 {
+		t.Fatalf("allocated GPU after unpipeline = %v, want 4000", got)
+	}
+}
+
 func Test_capacityPlugin_OnSessionOpenWithoutHierarchy(t *testing.T) {
 	plugins := map[string]framework.PluginBuilder{PluginName: New, predicates.PluginName: predicates.New, gang.PluginName: gang.New}
 	trueValue := true

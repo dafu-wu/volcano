@@ -532,7 +532,9 @@ func (ssn *Session) Pipeline(task *api.TaskInfo, hostname string) error {
 	for _, eh := range ssn.eventHandlers {
 		if eh.AllocateFunc != nil {
 			eh.AllocateFunc(&Event{
-				Task: task,
+				Task:              task,
+				Operation:         EventPipeline,
+				ExternalResources: false,
 			})
 		}
 	}
@@ -579,7 +581,9 @@ func (ssn *Session) Allocate(task *api.TaskInfo, nodeInfo *api.NodeInfo) (err er
 	for _, eh := range ssn.eventHandlers {
 		if eh.AllocateFunc != nil {
 			eh.AllocateFunc(&Event{
-				Task: task,
+				Task:              task,
+				Operation:         EventAllocate,
+				ExternalResources: true,
 			})
 		}
 	}
@@ -703,7 +707,9 @@ func (ssn *Session) Evict(reclaimee *api.TaskInfo, reason string) error {
 	for _, eh := range ssn.eventHandlers {
 		if eh.DeallocateFunc != nil {
 			eh.DeallocateFunc(&Event{
-				Task: reclaimee,
+				Task:              reclaimee,
+				Operation:         EventDeallocate,
+				ExternalResources: true,
 			})
 		}
 	}
@@ -869,8 +875,9 @@ func (ssn *Session) SweepStaleDRAInFlightAllocations(callsite string) int {
 // (preserving Pipelined task state for reclaim/preempt visibility).
 //
 // Background:
-//   - DRA Reserve() is called inside predicatesPlugin.AllocateFunc, BEFORE the task is recorded
-//     into Statement.operations via stmt.Allocate()/stmt.Pipeline(). It records an
+//   - DRA Reserve() is called inside predicatesPlugin.AllocateFunc for real allocate
+//     events, BEFORE the task is recorded into Statement.operations via stmt.Allocate().
+//     It records an
 //     inFlightAllocation that promises "I will write claim.Status.Allocation into etcd via PreBind".
 //   - When JobReady==false but JobPipelined==true, allocate.go does NOT call stmt.Discard(),
 //     so DRA Unreserve() (which would clean inFlightAllocations) is never invoked.

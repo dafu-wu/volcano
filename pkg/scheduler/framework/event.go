@@ -24,10 +24,31 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/api"
 )
 
+// EventOperation describes the scheduler state transition that raised an event.
+type EventOperation string
+
+const (
+	// EventAllocate is a real allocation which may later be bound.
+	EventAllocate EventOperation = "Allocate"
+	// EventPipeline is a scheduler-internal reservation against releasing resources.
+	EventPipeline EventOperation = "Pipeline"
+	// EventDeallocate rolls back or releases a real allocation.
+	EventDeallocate EventOperation = "Deallocate"
+	// EventUnPipeline releases a scheduler-internal pipeline reservation.
+	EventUnPipeline EventOperation = "UnPipeline"
+)
+
 // Event structure
 type Event struct {
-	Task *api.TaskInfo
-	Err  error
+	Task      *api.TaskInfo
+	Err       error
+	Operation EventOperation
+
+	// ExternalResources indicates whether callbacks may run external reservation
+	// side effects, such as DRA/volume Reserve and device Allocate/Release.
+	// Pipeline events are scheduler-internal future reservations and must keep
+	// this false; real allocate/evict rollback paths set it true.
+	ExternalResources bool
 }
 
 // EventHandler structure
