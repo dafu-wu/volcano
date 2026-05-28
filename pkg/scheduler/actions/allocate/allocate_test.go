@@ -31,6 +31,7 @@ import (
 	resourcev1beta1 "k8s.io/api/resource/v1beta1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
@@ -44,6 +45,7 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/conf"
 	"volcano.sh/volcano/pkg/scheduler/framework"
 	"volcano.sh/volcano/pkg/scheduler/plugins/binpack"
+	"volcano.sh/volcano/pkg/scheduler/plugins/capacity"
 	"volcano.sh/volcano/pkg/scheduler/plugins/drf"
 	"volcano.sh/volcano/pkg/scheduler/plugins/gang"
 	"volcano.sh/volcano/pkg/scheduler/plugins/nodeorder"
@@ -1656,6 +1658,415 @@ func TestFareShareAllocate(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestAllocatePipelinedNominatedPodBindsWhenIdle(t *testing.T) {
+	trueValue := true
+	plugins := map[string]framework.PluginBuilder{
+		drf.PluginName:        drf.New,
+		proportion.PluginName: proportion.New,
+		predicates.PluginName: predicates.New,
+		nodeorder.PluginName:  nodeorder.New,
+		gang.PluginName:       gang.New,
+	}
+	tiers := []conf.Tier{
+		{
+			Plugins: []conf.PluginOption{
+				{
+					Name:                gang.PluginName,
+					EnabledJobOrder:     &trueValue,
+					EnabledJobReady:     &trueValue,
+					EnabledJobPipelined: &trueValue,
+					EnabledJobStarving:  &trueValue,
+				},
+				{
+					Name:               drf.PluginName,
+					EnabledPreemptable: &trueValue,
+					EnabledJobOrder:    &trueValue,
+				},
+				{
+					Name:               proportion.PluginName,
+					EnabledQueueOrder:  &trueValue,
+					EnabledReclaimable: &trueValue,
+					EnabledAllocatable: &trueValue,
+				},
+				{
+					Name:             predicates.PluginName,
+					EnabledPredicate: &trueValue,
+				},
+				{
+					Name:             nodeorder.PluginName,
+					EnabledNodeOrder: &trueValue,
+				},
+			},
+		},
+	}
+	test := uthelper.TestCommonStruct{
+		Name: "pipelined pod with nominated node binds after resource becomes idle",
+		PodGroups: []*schedulingv1.PodGroup{
+			util.BuildPodGroup("pg1", "c1", "c1", 1, nil, schedulingv1.PodGroupInqueue),
+		},
+		Pods: []*v1.Pod{
+			func() *v1.Pod {
+				pod := util.BuildPod("c1", "p1", "", v1.PodPending, api.BuildResourceList("1", "1G"), "pg1", nil, nil)
+				pod.Status.NominatedNodeName = "n1"
+				return pod
+			}(),
+		},
+		Nodes: []*v1.Node{
+			util.BuildNode("n1", api.BuildResourceList("2", "4Gi", []api.ScalarResource{{Name: "pods", Value: "10"}}...), nil),
+		},
+		Queues: []*schedulingv1.Queue{
+			util.BuildQueue("c1", 1, nil),
+		},
+		Plugins: plugins,
+		ExpectBindMap: map[string]string{
+			"c1/p1": "n1",
+		},
+		ExpectBindsNum: 1,
+		ExpectTaskStatusNums: map[api.JobID]map[api.TaskStatus]int{
+			"c1/pg1": {api.Binding: 1},
+		},
+	}
+
+	test.RegisterSession(tiers, nil)
+	defer test.Close()
+
+	action := New()
+	test.Run([]framework.Action{action})
+	if err := test.CheckAll(0); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAllocatePipelinedNominatedPodFallsBackToIdleNode(t *testing.T) {
+	trueValue := true
+	plugins := map[string]framework.PluginBuilder{
+		drf.PluginName:        drf.New,
+		proportion.PluginName: proportion.New,
+		predicates.PluginName: predicates.New,
+		nodeorder.PluginName:  nodeorder.New,
+		gang.PluginName:       gang.New,
+	}
+	tiers := []conf.Tier{
+		{
+			Plugins: []conf.PluginOption{
+				{
+					Name:                gang.PluginName,
+					EnabledJobOrder:     &trueValue,
+					EnabledJobReady:     &trueValue,
+					EnabledJobPipelined: &trueValue,
+					EnabledJobStarving:  &trueValue,
+				},
+				{
+					Name:               drf.PluginName,
+					EnabledPreemptable: &trueValue,
+					EnabledJobOrder:    &trueValue,
+				},
+				{
+					Name:               proportion.PluginName,
+					EnabledQueueOrder:  &trueValue,
+					EnabledReclaimable: &trueValue,
+					EnabledAllocatable: &trueValue,
+				},
+				{
+					Name:             predicates.PluginName,
+					EnabledPredicate: &trueValue,
+				},
+				{
+					Name:             nodeorder.PluginName,
+					EnabledNodeOrder: &trueValue,
+				},
+			},
+		},
+	}
+	test := uthelper.TestCommonStruct{
+		Name: "pipelined pod retries all nodes when nominated node is still busy",
+		PodGroups: []*schedulingv1.PodGroup{
+			util.BuildPodGroup("pg1", "c1", "c1", 1, nil, schedulingv1.PodGroupInqueue),
+			util.BuildPodGroup("pg2", "c1", "c1", 1, nil, schedulingv1.PodGroupRunning),
+		},
+		Pods: []*v1.Pod{
+			func() *v1.Pod {
+				pod := util.BuildPod("c1", "p1", "", v1.PodPending, api.BuildResourceList("1", "1G"), "pg1", nil, nil)
+				pod.Status.NominatedNodeName = "n1"
+				return pod
+			}(),
+			util.BuildPod("c1", "busy", "n1", v1.PodRunning, api.BuildResourceList("1", "1G"), "pg2", nil, nil),
+		},
+		Nodes: []*v1.Node{
+			util.BuildNode("n1", api.BuildResourceList("1", "4Gi", []api.ScalarResource{{Name: "pods", Value: "10"}}...), nil),
+			util.BuildNode("n2", api.BuildResourceList("1", "4Gi", []api.ScalarResource{{Name: "pods", Value: "10"}}...), nil),
+		},
+		Queues: []*schedulingv1.Queue{
+			util.BuildQueue("c1", 1, nil),
+		},
+		Plugins: plugins,
+		ExpectBindMap: map[string]string{
+			"c1/p1": "n2",
+		},
+		ExpectBindsNum: 1,
+		ExpectTaskStatusNums: map[api.JobID]map[api.TaskStatus]int{
+			"c1/pg1": {api.Binding: 1},
+		},
+	}
+
+	test.RegisterSession(tiers, nil)
+	defer test.Close()
+
+	action := New()
+	test.Run([]framework.Action{action})
+	if err := test.CheckAll(0); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAllocatePipelinedNominatedPodRestoresReservationOnPredicateFailure(t *testing.T) {
+	trueValue := true
+	plugins := map[string]framework.PluginBuilder{
+		drf.PluginName:        drf.New,
+		proportion.PluginName: proportion.New,
+		predicates.PluginName: predicates.New,
+		nodeorder.PluginName:  nodeorder.New,
+		gang.PluginName:       gang.New,
+	}
+	tiers := []conf.Tier{
+		{
+			Plugins: []conf.PluginOption{
+				{
+					Name:                gang.PluginName,
+					EnabledJobOrder:     &trueValue,
+					EnabledJobReady:     &trueValue,
+					EnabledJobPipelined: &trueValue,
+					EnabledJobStarving:  &trueValue,
+				},
+				{
+					Name:               drf.PluginName,
+					EnabledPreemptable: &trueValue,
+					EnabledJobOrder:    &trueValue,
+				},
+				{
+					Name:               proportion.PluginName,
+					EnabledQueueOrder:  &trueValue,
+					EnabledReclaimable: &trueValue,
+					EnabledAllocatable: &trueValue,
+				},
+				{
+					Name:             predicates.PluginName,
+					EnabledPredicate: &trueValue,
+				},
+				{
+					Name:             nodeorder.PluginName,
+					EnabledNodeOrder: &trueValue,
+				},
+			},
+		},
+	}
+	test := uthelper.TestCommonStruct{
+		Name: "pipelined pod restores nominated reservation when predicate fails",
+		PodGroups: []*schedulingv1.PodGroup{
+			util.BuildPodGroup("pg1", "c1", "c1", 1, nil, schedulingv1.PodGroupInqueue),
+		},
+		Pods: []*v1.Pod{
+			func() *v1.Pod {
+				pod := util.BuildPod("c1", "p1", "", v1.PodPending, api.BuildResourceList("1", "1G"), "pg1", nil, map[string]string{"disk": "ssd"})
+				pod.Status.NominatedNodeName = "n1"
+				return pod
+			}(),
+		},
+		Nodes: []*v1.Node{
+			util.BuildNode("n1", api.BuildResourceList("2", "4Gi", []api.ScalarResource{{Name: "pods", Value: "10"}}...), map[string]string{"disk": "hdd"}),
+		},
+		Queues: []*schedulingv1.Queue{
+			util.BuildQueue("c1", 1, nil),
+		},
+		Plugins: plugins,
+		ExpectPipeLined: map[string][]string{
+			"c1/pg1": {"n1"},
+		},
+		ExpectTaskStatusNums: map[api.JobID]map[api.TaskStatus]int{
+			"c1/pg1": {
+				api.Pending:   0,
+				api.Pipelined: 1,
+				api.Binding:   0,
+			},
+		},
+		ExpectBindsNum: 0,
+	}
+
+	test.RegisterSession(tiers, nil)
+	defer test.Close()
+
+	action := New()
+	test.Run([]framework.Action{action})
+	if err := test.CheckAll(0); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAllocatePipelinedNominatedPodStillChecksQueueAllocatable(t *testing.T) {
+	trueValue := true
+	plugins := map[string]framework.PluginBuilder{
+		capacity.PluginName:   capacity.New,
+		predicates.PluginName: predicates.New,
+		nodeorder.PluginName:  nodeorder.New,
+		gang.PluginName:       gang.New,
+	}
+	tiers := []conf.Tier{
+		{
+			Plugins: []conf.PluginOption{
+				{
+					Name:                gang.PluginName,
+					EnabledJobOrder:     &trueValue,
+					EnabledJobReady:     &trueValue,
+					EnabledJobPipelined: &trueValue,
+					EnabledJobStarving:  &trueValue,
+				},
+				{
+					Name:               capacity.PluginName,
+					EnabledAllocatable: &trueValue,
+				},
+				{
+					Name:             predicates.PluginName,
+					EnabledPredicate: &trueValue,
+				},
+				{
+					Name:             nodeorder.PluginName,
+					EnabledNodeOrder: &trueValue,
+				},
+			},
+		},
+	}
+
+	gpu1 := api.BuildResourceList("", "", []api.ScalarResource{{Name: "nvidia.com/gpu", Value: "1"}}...)
+	test := uthelper.TestCommonStruct{
+		Name: "pipelined pod cannot bypass queue capability after nominated node becomes idle",
+		PodGroups: []*schedulingv1.PodGroup{
+			util.BuildPodGroup("pg1", "c1", "c1", 1, nil, schedulingv1.PodGroupInqueue),
+			util.BuildPodGroup("pg2", "c1", "c1", 1, nil, schedulingv1.PodGroupRunning),
+		},
+		Pods: []*v1.Pod{
+			func() *v1.Pod {
+				pod := util.BuildPod("c1", "p1", "", v1.PodPending, gpu1, "pg1", nil, nil)
+				pod.Status.NominatedNodeName = "n2"
+				return pod
+			}(),
+			util.BuildPod("c1", "running", "n1", v1.PodRunning, gpu1, "pg2", nil, nil),
+		},
+		Nodes: []*v1.Node{
+			util.BuildNode("n1", api.BuildResourceList("1", "4Gi", []api.ScalarResource{{Name: "nvidia.com/gpu", Value: "1"}, {Name: "pods", Value: "10"}}...), nil),
+			util.BuildNode("n2", api.BuildResourceList("1", "4Gi", []api.ScalarResource{{Name: "nvidia.com/gpu", Value: "1"}, {Name: "pods", Value: "10"}}...), nil),
+		},
+		Queues: []*schedulingv1.Queue{
+			util.BuildQueueWithResourcesQuantity("c1", nil, gpu1),
+		},
+		Plugins: plugins,
+		ExpectTaskStatusNums: map[api.JobID]map[api.TaskStatus]int{
+			"c1/pg1": {
+				api.Pending:   1,
+				api.Pipelined: 0,
+				api.Binding:   0,
+			},
+		},
+		ExpectBindsNum: 0,
+	}
+
+	test.RegisterSession(tiers, nil)
+	defer test.Close()
+
+	action := New()
+	test.Run([]framework.Action{action})
+	if err := test.CheckAll(0); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAllocateRollsBackAllocatedTasksWhenGangOnlyPipelined(t *testing.T) {
+	trueValue := true
+	plugins := map[string]framework.PluginBuilder{
+		drf.PluginName:        drf.New,
+		proportion.PluginName: proportion.New,
+		predicates.PluginName: predicates.New,
+		nodeorder.PluginName:  nodeorder.New,
+		gang.PluginName:       gang.New,
+	}
+	tiers := []conf.Tier{
+		{
+			Plugins: []conf.PluginOption{
+				{
+					Name:                gang.PluginName,
+					EnabledJobOrder:     &trueValue,
+					EnabledJobReady:     &trueValue,
+					EnabledJobPipelined: &trueValue,
+					EnabledJobStarving:  &trueValue,
+				},
+				{
+					Name:               drf.PluginName,
+					EnabledPreemptable: &trueValue,
+					EnabledJobOrder:    &trueValue,
+				},
+				{
+					Name:               proportion.PluginName,
+					EnabledQueueOrder:  &trueValue,
+					EnabledReclaimable: &trueValue,
+					EnabledAllocatable: &trueValue,
+				},
+				{
+					Name:             predicates.PluginName,
+					EnabledPredicate: &trueValue,
+				},
+				{
+					Name:             nodeorder.PluginName,
+					EnabledNodeOrder: &trueValue,
+				},
+			},
+		},
+	}
+
+	releasingPod := util.BuildPod("c1", "victim", "n2", v1.PodRunning, api.BuildResourceList("1", "1G"), "pg2", nil, nil)
+	now := metav1.Now()
+	releasingPod.DeletionTimestamp = &now
+
+	test := uthelper.TestCommonStruct{
+		Name: "allocated tasks are rolled back when gang only reaches pipelined",
+		PodGroups: []*schedulingv1.PodGroup{
+			util.BuildPodGroup("pg1", "c1", "c1", 2, nil, schedulingv1.PodGroupInqueue),
+			util.BuildPodGroup("pg2", "c1", "c1", 1, nil, schedulingv1.PodGroupRunning),
+		},
+		Pods: []*v1.Pod{
+			util.BuildPod("c1", "p1", "", v1.PodPending, api.BuildResourceList("1", "1G"), "pg1", nil, nil),
+			util.BuildPod("c1", "p2", "", v1.PodPending, api.BuildResourceList("1", "1G"), "pg1", nil, nil),
+			releasingPod,
+		},
+		Nodes: []*v1.Node{
+			util.BuildNode("n1", api.BuildResourceList("1", "4Gi", []api.ScalarResource{{Name: "pods", Value: "10"}}...), nil),
+			util.BuildNode("n2", api.BuildResourceList("1", "4Gi", []api.ScalarResource{{Name: "pods", Value: "10"}}...), nil),
+		},
+		Queues: []*schedulingv1.Queue{
+			util.BuildQueue("c1", 1, nil),
+		},
+		Plugins: plugins,
+		ExpectPipeLined: map[string][]string{
+			"c1/pg1": {"n2"},
+		},
+		ExpectTaskStatusNums: map[api.JobID]map[api.TaskStatus]int{
+			"c1/pg1": {
+				api.Pending:   1,
+				api.Pipelined: 1,
+				api.Allocated: 0,
+				api.Binding:   0,
+			},
+		},
+	}
+
+	test.RegisterSession(tiers, nil)
+	defer test.Close()
+
+	action := New()
+	test.Run([]framework.Action{action})
+	if err := test.CheckAll(0); err != nil {
+		t.Fatal(err)
 	}
 }
 

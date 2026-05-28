@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
@@ -164,19 +165,20 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 		}
 		attr := cp.queueOpts[queue.UID]
 
+		reclaimReq := reclaimPreemptiveRequest(ssn.Jobs[task.Job], task)
 		currentUsed := attr.used()
-		futureUsed := currentUsed.Clone().Add(task.Resreq)
-		overused := !futureUsed.LessEqualWithDimension(attr.deserved, task.Resreq)
+		futureUsed := currentUsed.Clone().Add(reclaimReq)
+		overused := !futureUsed.LessEqualWithDimension(attr.deserved, reclaimReq)
 		metrics.UpdateQueueOverused(attr.name, overused)
 		if overused {
 			klog.V(3).Infof("Queue <%v> cannot reclaim: queue would exceed deserved resources after allocation", queue.Name)
-			klog.V(3).Infof("  Task <%s/%s> resource request: %v", task.Namespace, task.Name, task.Resreq)
+			klog.V(3).Infof("  Task <%s/%s> resource request: %v, reclaim preemptive request: %v", task.Namespace, task.Name, task.Resreq, reclaimReq)
 			klog.V(3).Infof("  Queue <%v> deserved: %v, allocated: %v, pipelined: %v, used: %v, share: %.2f", queue.Name, attr.deserved, attr.allocated, attr.pipelined, currentUsed, attr.share)
 			klog.V(3).Infof("  Future usage after allocation: %v", futureUsed)
 
 			// Check which resource dimension exceeds deserved
 			exceedingResources := []string{}
-			for name, quant := range task.Resreq.ScalarResources {
+			for name, quant := range reclaimReq.ScalarResources {
 				if api.IsIgnoredScalarResource(name) {
 					continue
 				}
@@ -245,8 +247,9 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 			return util.Permit
 		}
 
-		if job.PodGroup.Spec.MinResources == nil {
-			klog.V(4).Infof("job %s MinResources is null.", job.Name)
+		minReq := jobMinimumResources(job)
+		if minReq.IsEmpty() {
+			klog.V(4).Infof("job %s has no effective min resources.", job.Name)
 			return util.Permit
 		}
 
@@ -255,7 +258,7 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 		}
 
 		// job enqueued
-		deductedResources := job.DeductSchGatedResources(job.GetMinResources())
+		deductedResources := job.DeductSchGatedResources(minReq)
 		attr.inqueue.Add(deductedResources)
 		// If enable hierarchy, update the inqueue resource for all ancestors queues
 		if hierarchyEnabled {
@@ -477,6 +480,11 @@ func (cp *capacityPlugin) buildQueueAttrs(ssn *framework.Session) {
 					attr.allocated.Add(t.Resreq)
 					attr.request.Add(t.Resreq)
 				}
+			} else if status == api.Pipelined {
+				for _, t := range tasks {
+					attr.addPipelined(job.UID, t.Resreq)
+					attr.request.Add(t.Resreq)
+				}
 			} else if status == api.Pending {
 				for _, t := range tasks {
 					attr.request.Add(t.Resreq)
@@ -487,19 +495,18 @@ func (cp *capacityPlugin) buildQueueAttrs(ssn *framework.Session) {
 		if job.PodGroup.Status.Phase == scheduling.PodGroupInqueue {
 			// deduct the resources of scheduling gated tasks in a job when calculating inqueued resources
 			// so that it will not block other jobs from being inqueued.
-			attr.inqueue.Add(job.DeductSchGatedResources(job.GetMinResources()))
+			attr.inqueue.Add(job.DeductSchGatedResources(jobMinimumResources(job)))
 		}
 
 		// calculate inqueue resource for running jobs
 		// the judgement 'job.PodGroup.Status.Running >= job.PodGroup.Spec.MinMember' will work on cases such as the following condition:
 		// Considering a Spark job is completed(driver pod is completed) while the podgroup keeps running, the allocated resource will be reserved again if without the judgement.
 		if job.PodGroup.Status.Phase == scheduling.PodGroupRunning &&
-			job.PodGroup.Spec.MinResources != nil &&
 			int32(util.CalculateAllocatedTaskNum(job)) >= job.PodGroup.Spec.MinMember {
-			inqueued := util.GetInqueueResource(job, job.Allocated)
+			inqueued := jobInqueueResource(job, job.Allocated)
 			attr.inqueue.Add(job.DeductSchGatedResources(inqueued))
 		}
-		attr.elastic.Add(job.GetElasticResources())
+		attr.elastic.Add(jobElasticResources(job))
 		klog.V(5).Infof("Queue %s allocated <%s> pipelined <%s> request <%s> inqueue <%s> elastic <%s>",
 			attr.name, attr.allocated.String(), attr.pipelined.String(), attr.request.String(), attr.inqueue.String(), attr.elastic.String())
 	}
@@ -601,6 +608,7 @@ func (cp *capacityPlugin) buildHierarchicalQueueAttrs(ssn *framework.Session) bo
 		}
 
 		oldAllocated := attr.allocated.Clone()
+		oldPipelined := attr.pipelined.Clone()
 		oldRequest := attr.request.Clone()
 		oldInqueue := attr.inqueue.Clone()
 		oldElastic := attr.elastic.Clone()
@@ -611,6 +619,11 @@ func (cp *capacityPlugin) buildHierarchicalQueueAttrs(ssn *framework.Session) bo
 					attr.allocated.Add(t.Resreq)
 					attr.request.Add(t.Resreq)
 				}
+			} else if status == api.Pipelined {
+				for _, t := range tasks {
+					attr.addPipelined(job.UID, t.Resreq)
+					attr.request.Add(t.Resreq)
+				}
 			} else if status == api.Pending {
 				for _, t := range tasks {
 					attr.request.Add(t.Resreq)
@@ -619,23 +632,34 @@ func (cp *capacityPlugin) buildHierarchicalQueueAttrs(ssn *framework.Session) bo
 		}
 
 		if job.PodGroup.Status.Phase == scheduling.PodGroupInqueue {
-			attr.inqueue.Add(job.DeductSchGatedResources(job.GetMinResources()))
+			attr.inqueue.Add(job.DeductSchGatedResources(jobMinimumResources(job)))
 		}
 
 		// calculate inqueue resource for running jobs
 		// the judgement 'job.PodGroup.Status.Running >= job.PodGroup.Spec.MinMember' will work on cases such as the following condition:
 		// Considering a Spark job is completed(driver pod is completed) while the podgroup keeps running, the allocated resource will be reserved again if without the judgement.
 		if job.PodGroup.Status.Phase == scheduling.PodGroupRunning &&
-			job.PodGroup.Spec.MinResources != nil &&
 			int32(util.CalculateAllocatedTaskNum(job)) >= job.PodGroup.Spec.MinMember {
-			inqueued := util.GetInqueueResource(job, job.Allocated)
+			inqueued := jobInqueueResource(job, job.Allocated)
 			attr.inqueue.Add(job.DeductSchGatedResources(inqueued))
 		}
-		attr.elastic.Add(job.GetElasticResources())
+		attr.elastic.Add(jobElasticResources(job))
 
 		for _, ancestor := range attr.ancestors {
 			ancestorAttr := cp.queueOpts[ancestor]
 			ancestorAttr.allocated.Add(attr.allocated.Clone().Sub(oldAllocated))
+			// pipelinedDelta is computed as (current - old). In this rebuild loop
+			// values are always re-aggregated from scratch per leaf queue, so the
+			// delta is non-negative. We still defensively guard the negative case
+			// by routing through subPipelined to keep the per-job bookkeeping
+			// consistent.
+			if attr.pipelined.LessEqual(oldPipelined, api.Zero) {
+				if subDelta := oldPipelined.Clone().Sub(attr.pipelined); !subDelta.IsEmpty() {
+					ancestorAttr.subPipelined(job.UID, subDelta)
+				}
+			} else if pipelinedDelta := attr.pipelined.Clone().Sub(oldPipelined); !pipelinedDelta.IsEmpty() {
+				ancestorAttr.addPipelined(job.UID, pipelinedDelta)
+			}
 			ancestorAttr.request.Add(attr.request.Clone().Sub(oldRequest))
 			ancestorAttr.inqueue.Add(attr.inqueue.Clone().Sub(oldInqueue))
 			ancestorAttr.elastic.Add(attr.elastic.Clone().Sub(oldElastic))
@@ -908,6 +932,171 @@ func (qa *queueAttr) used() *api.Resource {
 	return used
 }
 
+func reclaimPreemptiveRequest(job *api.JobInfo, task *api.TaskInfo) *api.Resource {
+	if task == nil {
+		return api.EmptyResource()
+	}
+	if job == nil || job.PodGroup == nil {
+		return task.Resreq
+	}
+
+	minReq := job.DeductSchGatedResources(jobMinimumResources(job))
+	remaining := api.ExceededPart(minReq, jobReservedResource(job))
+	if remaining.IsEmpty() {
+		return task.Resreq
+	}
+	return remaining
+}
+
+func jobReservedResource(job *api.JobInfo) *api.Resource {
+	reserved := api.EmptyResource()
+	if job == nil {
+		return reserved
+	}
+
+	for status, tasks := range job.TaskStatusIndex {
+		if !api.AllocatedStatus(status) && status != api.Pipelined {
+			continue
+		}
+		for _, task := range tasks {
+			reserved.Add(task.Resreq)
+		}
+	}
+	return reserved
+}
+
+func jobMinimumResources(job *api.JobInfo) *api.Resource {
+	if job == nil || job.PodGroup == nil {
+		return api.EmptyResource()
+	}
+	if job.PodGroup.Spec.MinResources != nil {
+		return job.GetMinResources()
+	}
+	return inferMinAvailableResources(job)
+}
+
+func inferMinAvailableResources(job *api.JobInfo) *api.Resource {
+	if job == nil || job.MinAvailable <= 0 {
+		return api.EmptyResource()
+	}
+
+	if job.MinAvailable < job.TaskMinAvailableTotal {
+		res := api.EmptyResource()
+		for role, minAvailable := range job.TaskMinAvailable {
+			res.Add(sumSmallestTaskRequests(tasksForRole(job, role), int(minAvailable)))
+		}
+		return res
+	}
+
+	tasks := make([]*api.TaskInfo, 0, len(job.Tasks))
+	for _, task := range job.Tasks {
+		tasks = append(tasks, task)
+	}
+	return sumSmallestTaskRequests(tasks, int(job.MinAvailable))
+}
+
+func tasksForRole(job *api.JobInfo, role string) []*api.TaskInfo {
+	tasks := []*api.TaskInfo{}
+	for _, task := range job.Tasks {
+		if task == nil || task.TaskRole != role {
+			continue
+		}
+		tasks = append(tasks, task)
+	}
+	return tasks
+}
+
+func sumSmallestTaskRequests(tasks []*api.TaskInfo, count int) *api.Resource {
+	res := api.EmptyResource()
+	if count <= 0 {
+		return res
+	}
+
+	filtered := make([]*api.TaskInfo, 0, len(tasks))
+	for _, task := range tasks {
+		if task == nil || task.Resreq == nil {
+			continue
+		}
+		filtered = append(filtered, task)
+	}
+	sort.Slice(filtered, func(i, j int) bool {
+		return resourceLessForMin(filtered[i].Resreq, filtered[j].Resreq)
+	})
+
+	visibleCount := count
+	if visibleCount > len(filtered) {
+		visibleCount = len(filtered)
+	}
+	for i := 0; i < visibleCount; i++ {
+		addScalarResources(res, filtered[i].Resreq)
+	}
+	for i := visibleCount; i < count && len(filtered) > 0; i++ {
+		addScalarResources(res, filtered[len(filtered)-1].Resreq)
+	}
+	return res
+}
+
+func addScalarResources(total, req *api.Resource) {
+	if total == nil || req == nil {
+		return
+	}
+	for name, value := range req.ScalarResources {
+		if api.IsIgnoredScalarResource(name) {
+			continue
+		}
+		if total.ScalarResources == nil {
+			total.ScalarResources = map[v1.ResourceName]float64{}
+		}
+		total.ScalarResources[name] += value
+	}
+}
+
+func resourceLessForMin(left, right *api.Resource) bool {
+	leftGPU := left.Get(v1.ResourceName(api.GPUResourceName))
+	rightGPU := right.Get(v1.ResourceName(api.GPUResourceName))
+	if leftGPU != rightGPU {
+		return leftGPU < rightGPU
+	}
+
+	leftScalar := scalarResourceTotal(left)
+	rightScalar := scalarResourceTotal(right)
+	if leftScalar != rightScalar {
+		return leftScalar < rightScalar
+	}
+	if left.MilliCPU != right.MilliCPU {
+		return left.MilliCPU < right.MilliCPU
+	}
+	return left.Memory < right.Memory
+}
+
+func scalarResourceTotal(res *api.Resource) float64 {
+	if res == nil {
+		return 0
+	}
+	total := float64(0)
+	for name, value := range res.ScalarResources {
+		if api.IsIgnoredScalarResource(name) {
+			continue
+		}
+		total += value
+	}
+	return total
+}
+
+func jobInqueueResource(job *api.JobInfo, allocated *api.Resource) *api.Resource {
+	if allocated == nil {
+		allocated = api.EmptyResource()
+	}
+	return api.ExceededPart(jobMinimumResources(job), allocated)
+}
+
+func jobElasticResources(job *api.JobInfo) *api.Resource {
+	if job == nil || job.Allocated == nil {
+		return api.EmptyResource()
+	}
+	return api.ExceededPart(job.Allocated, jobMinimumResources(job))
+}
+
 func (qa *queueAttr) addPipelined(jobID api.JobID, res *api.Resource) {
 	if qa.pipelined == nil {
 		qa.pipelined = api.EmptyResource()
@@ -985,7 +1174,7 @@ func (cp *capacityPlugin) checkQueueAllocatableHierarchically(ssn *framework.Ses
 
 func (cp *capacityPlugin) jobEnqueueable(queue *api.QueueInfo, job *api.JobInfo) bool {
 	attr := cp.queueOpts[queue.UID]
-	minReq := job.GetMinResources()
+	minReq := jobMinimumResources(job)
 
 	klog.V(5).Infof("job %s min resource <%s>, queue %s capability <%s> allocated <%s> pipelined <%s> inqueue <%s> elastic <%s>",
 		job.Name, minReq.String(), queue.Name, attr.realCapability.String(), attr.allocated.String(), attr.pipelined.String(), attr.inqueue.String(), attr.elastic.String())

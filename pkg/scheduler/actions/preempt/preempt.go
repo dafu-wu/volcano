@@ -378,10 +378,7 @@ func (pmpt *Action) normalPreempt(
 			preempted.Add(preemptee.Resreq)
 		}
 
-		evictionOccurred := false
-		if !preempted.IsEmpty() {
-			evictionOccurred = true
-		}
+		evictionOccurred := !preempted.IsEmpty() || !node.Releasing.IsEmpty()
 
 		metrics.RegisterPreemptionAttempts()
 		klog.V(3).Infof("Preempted <%v> for Task <%s/%s> requested <%v>.",

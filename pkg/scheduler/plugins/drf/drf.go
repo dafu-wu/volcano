@@ -197,7 +197,13 @@ func (drf *drfPlugin) OnSessionOpen(ssn *framework.Session) {
 		}
 
 		for status, tasks := range job.TaskStatusIndex {
-			if api.AllocatedStatus(status) {
+			// Pipelined tasks are scheduler-internal reservations for resources
+			// that are expected to be released. They are folded into attr.allocated
+			// here so that DRF share calculation reflects the effective resource
+			// usage (real allocated + pipelined reservation) of the job. This is
+			// consistent with the capacity plugin which exposes the combined value
+			// through queueAttr.used().
+			if api.AllocatedStatus(status) || status == api.Pipelined {
 				for _, t := range tasks {
 					attr.allocated.Add(t.Resreq)
 				}

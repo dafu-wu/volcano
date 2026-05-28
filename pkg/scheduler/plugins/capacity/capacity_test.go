@@ -63,7 +63,7 @@ func TestQueueAttrPipelinedReservationsAreSeparateFromAllocated(t *testing.T) {
 		pipelinedJob:   map[api.JobID]*api.Resource{},
 		realCapability: gpu("8"),
 	}
-	queue := &api.QueueInfo{Name: "q1"}
+	queue := &api.QueueInfo{UID: api.QueueID("q1"), Name: "q1"}
 
 	first := task("first", "2")
 	second := task("second", "2")
@@ -106,6 +106,126 @@ func TestQueueAttrPipelinedReservationsAreSeparateFromAllocated(t *testing.T) {
 	}
 	if got := attr.allocated.Get("nvidia.com/gpu"); got != 4000 {
 		t.Fatalf("allocated GPU after unpipeline = %v, want 4000", got)
+	}
+}
+
+func TestReclaimPreemptiveRequestUsesRemainingGangMinResources(t *testing.T) {
+	gpu := func(value string) *api.Resource {
+		return api.NewResource(api.BuildResourceList("", "", api.ScalarResource{Name: "nvidia.com/gpu", Value: value}))
+	}
+	task := func(name string, status api.TaskStatus) *api.TaskInfo {
+		return &api.TaskInfo{
+			UID:        api.TaskID(name),
+			Job:        api.JobID("ns1/pg1"),
+			Name:       name,
+			Namespace:  "ns1",
+			Resreq:     gpu("2"),
+			InitResreq: gpu("2"),
+			TransactionContext: api.TransactionContext{
+				Status: status,
+			},
+		}
+	}
+
+	pending := task("pending", api.Pending)
+	anotherPending := task("another-pending", api.Pending)
+	job := api.NewJobInfo(api.JobID("ns1/pg1"), pending, anotherPending)
+	minResources := api.BuildResourceList("", "", api.ScalarResource{Name: "nvidia.com/gpu", Value: "4"})
+	pg := &api.PodGroup{
+		PodGroup: scheduling.PodGroup{
+			Spec: scheduling.PodGroupSpec{
+				Queue:        "q1",
+				MinMember:    2,
+				MinResources: &minResources,
+			},
+			Status: scheduling.PodGroupStatus{
+				Phase: scheduling.PodGroupInqueue,
+			},
+		},
+	}
+	job.SetPodGroup(pg)
+
+	if got := reclaimPreemptiveRequest(job, pending).Get("nvidia.com/gpu"); got != 4000 {
+		t.Fatalf("reclaim request GPU = %v, want remaining gang min resource 4000", got)
+	}
+
+	pipelined := task("pipelined", api.Pipelined)
+	job = api.NewJobInfo(api.JobID("ns1/pg1"), pipelined, anotherPending)
+	job.SetPodGroup(pg)
+	if got := reclaimPreemptiveRequest(job, anotherPending).Get("nvidia.com/gpu"); got != 2000 {
+		t.Fatalf("reclaim request GPU with one pipelined task = %v, want remaining gang min resource 2000", got)
+	}
+
+	attr := &queueAttr{
+		name:      "q1",
+		deserved:  gpu("8"),
+		allocated: gpu("6"),
+		pipelined: api.EmptyResource(),
+	}
+	overfullJob := api.NewJobInfo(api.JobID("ns1/pg1"), pending, anotherPending)
+	overfullJob.SetPodGroup(pg)
+	req := reclaimPreemptiveRequest(overfullJob, pending)
+	if attr.used().Clone().Add(req).LessEqualWithDimension(attr.deserved, req) {
+		t.Fatalf("reclaim should be rejected when queue used 6 + remaining gang request 4 exceeds deserved 8")
+	}
+}
+
+func TestCapacityInfersMinResourcesWhenPodGroupMinResourcesUnset(t *testing.T) {
+	gpu := func(value string) *api.Resource {
+		return api.NewResource(api.BuildResourceList("", "", api.ScalarResource{Name: "nvidia.com/gpu", Value: value}))
+	}
+	task := func(name string, status api.TaskStatus) *api.TaskInfo {
+		return &api.TaskInfo{
+			UID:        api.TaskID(name),
+			Job:        api.JobID("ns1/pg1"),
+			Name:       name,
+			Namespace:  "ns1",
+			Resreq:     gpu("4"),
+			InitResreq: gpu("4"),
+			TransactionContext: api.TransactionContext{
+				Status: status,
+			},
+		}
+	}
+
+	tasks := []*api.TaskInfo{
+		task("pending-0", api.Pending),
+		task("pending-1", api.Pending),
+		task("pending-2", api.Pending),
+	}
+	job := api.NewJobInfo(api.JobID("ns1/pg1"), tasks...)
+	pg := &api.PodGroup{
+		PodGroup: scheduling.PodGroup{
+			Spec: scheduling.PodGroupSpec{
+				Queue:     "q1",
+				MinMember: 3,
+			},
+			Status: scheduling.PodGroupStatus{
+				Phase: scheduling.PodGroupInqueue,
+			},
+		},
+	}
+	job.SetPodGroup(pg)
+
+	if got := jobMinimumResources(job).Get("nvidia.com/gpu"); got != 12000 {
+		t.Fatalf("inferred min GPU = %v, want 12000", got)
+	}
+	if got := reclaimPreemptiveRequest(job, tasks[0]).Get("nvidia.com/gpu"); got != 12000 {
+		t.Fatalf("reclaim request GPU = %v, want inferred remaining gang min resource 12000", got)
+	}
+
+	attr := &queueAttr{
+		name:           "q1",
+		realCapability: gpu("16"),
+		allocated:      gpu("8"),
+		pipelined:      api.EmptyResource(),
+		inqueue:        api.EmptyResource(),
+		elastic:        api.EmptyResource(),
+	}
+	queue := &api.QueueInfo{UID: api.QueueID("q1"), Name: "q1"}
+	cp := &capacityPlugin{queueOpts: map[api.QueueID]*queueAttr{api.QueueID("q1"): attr}}
+	if cp.jobEnqueueable(queue, job) {
+		t.Fatalf("job should not be enqueueable: used 8 + inferred min 12 > capability 16")
 	}
 }
 

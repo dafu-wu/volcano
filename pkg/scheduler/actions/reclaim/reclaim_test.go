@@ -218,6 +218,42 @@ func TestReclaim(t *testing.T) {
 			ExpectEvictNum: 0,
 			ExpectEvicted:  []string{},
 		},
+		{
+			Name: "discard partial reclaim when gang cannot be fully pipelined",
+			Plugins: map[string]framework.PluginBuilder{
+				conformance.PluginName: conformance.New,
+				gang.PluginName:        gang.New,
+				proportion.PluginName:  proportion.New,
+			},
+			PodGroups: []*schedulingv1beta1.PodGroup{
+				util.BuildPodGroupWithPrio("pg1", "c1", "q1", 1, nil, schedulingv1beta1.PodGroupRunning, "low-priority"),
+				util.BuildPodGroupWithPrio("pg2", "c1", "q2", 2, nil, schedulingv1beta1.PodGroupInqueue, "high-priority"),
+			},
+			Pods: []*v1.Pod{
+				util.BuildPod("c1", "preemptee1", "n1", v1.PodRunning, api.BuildResourceList("1", "1G"), "pg1", map[string]string{schedulingv1beta1.PodPreemptable: "true"}, make(map[string]string)),
+				util.BuildPod("c1", "preemptor1", "", v1.PodPending, api.BuildResourceList("1", "1G"), "pg2", make(map[string]string), make(map[string]string)),
+				util.BuildPod("c1", "preemptor2", "", v1.PodPending, api.BuildResourceList("1", "1G"), "pg2", make(map[string]string), make(map[string]string)),
+			},
+			Nodes: []*v1.Node{
+				util.BuildNode("n1", api.BuildResourceList("1", "1Gi", []api.ScalarResource{{Name: "pods", Value: "10"}}...), make(map[string]string)),
+			},
+			Queues: []*schedulingv1beta1.Queue{
+				util.BuildQueue("q1", 1, nil),
+				util.BuildQueue("q2", 1, nil),
+			},
+			ExpectEvictNum: 0,
+			ExpectEvicted:  []string{},
+			ExpectTaskStatusNums: map[api.JobID]map[api.TaskStatus]int{
+				"c1/pg1": {
+					api.Running:   1,
+					api.Releasing: 0,
+				},
+				"c1/pg2": {
+					api.Pending:   2,
+					api.Pipelined: 0,
+				},
+			},
+		},
 	}
 
 	reclaim := New()

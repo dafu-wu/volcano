@@ -45,11 +45,15 @@ func (ra *Action) Initialize() {}
 
 func (ra *Action) Execute(ssn *framework.Session) {
 	klog.V(5).Infof("Enter Reclaim ...")
+	pendingStmts := map[api.JobID]*framework.Statement{}
 	defer func() {
-		// DRA safety net at action exit: reclaim uses ssn.Pipeline() directly (not via
-		// Statement), so any DRA Reserve() inFlight created during the matching Filter
-		// phase is not tied to a Statement and won't be Unreserved on failure. Sweep
-		// stale entries here to prevent cross-action poisoning.
+		for jobID, stmt := range pendingStmts {
+			klog.V(3).Infof("Discarding partial reclaim operations for Job <%s>; job did not reach pipelined state.", jobID)
+			stmt.Discard()
+		}
+		// DRA safety net at action exit. Predicate checks in this action may create
+		// Reserve() inFlight entries before a reclaim statement is committed.
+		// Sweep stale entries here to prevent cross-action poisoning.
 		ssn.SweepStaleDRAInFlightAllocations("reclaim.Execute.defer")
 		klog.V(5).Infof("Leaving Reclaim ...")
 	}()
@@ -128,6 +132,12 @@ func (ra *Action) Execute(ssn *framework.Session) {
 			continue
 		} else {
 			task = tasks.Pop().(*api.TaskInfo)
+		}
+
+		stmt, found := pendingStmts[job.UID]
+		if !found {
+			stmt = framework.NewStatement(ssn)
+			pendingStmts[job.UID] = stmt
 		}
 
 		if task.Pod.Spec.PreemptionPolicy != nil && *task.Pod.Spec.PreemptionPolicy == v1.PreemptNever {
@@ -222,7 +232,7 @@ func (ra *Action) Execute(ssn *framework.Session) {
 				reclaimee := victimsQueue.Pop().(*api.TaskInfo)
 				klog.Errorf("Try to reclaim Task <%s/%s> for Tasks <%s/%s>",
 					reclaimee.Namespace, reclaimee.Name, task.Namespace, task.Name)
-				if err := ssn.Evict(reclaimee, "reclaim"); err != nil {
+				if err := stmt.Evict(reclaimee, "reclaim"); err != nil {
 					klog.Errorf("Failed to reclaim Task <%s/%s> for Tasks <%s/%s>: %v",
 						reclaimee.Namespace, reclaimee.Name, task.Namespace, task.Name, err)
 					continue
@@ -238,7 +248,7 @@ func (ra *Action) Execute(ssn *framework.Session) {
 				reclaimed, task.Namespace, task.Name, task.InitResreq)
 
 			if task.InitResreq.LessEqual(reclaimed, api.Zero) {
-				if err := ssn.Pipeline(task, n.Name); err != nil {
+				if err := stmt.Pipeline(task, n.Name, true); err != nil {
 					klog.Errorf("Failed to pipeline Task <%s/%s> on Node <%s>",
 						task.Namespace, task.Name, n.Name)
 				}
@@ -251,7 +261,13 @@ func (ra *Action) Execute(ssn *framework.Session) {
 		}
 
 		if assigned {
-			jobs.Push(job)
+			if ssn.JobPipelined(job) {
+				klog.V(3).Infof("Job <%s/%s> reached pipelined state after reclaim; committing reclaim operations.", job.Namespace, job.Name)
+				stmt.Commit()
+				delete(pendingStmts, job.UID)
+			} else {
+				jobs.Push(job)
+			}
 		}
 		queues.Push(queue)
 	}

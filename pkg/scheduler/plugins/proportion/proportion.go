@@ -62,6 +62,7 @@ type queueAttr struct {
 
 	deserved  *api.Resource
 	allocated *api.Resource
+	pipelined *api.Resource
 	request   *api.Resource
 	// elastic represents the sum of job's elastic resource, job's elastic = job.allocated - job.minAvailable
 	elastic *api.Resource
@@ -112,6 +113,7 @@ func (pp *proportionPlugin) OnSessionOpen(ssn *framework.Session) {
 
 				deserved:  api.EmptyResource(),
 				allocated: api.EmptyResource(),
+				pipelined: api.EmptyResource(),
 				request:   api.EmptyResource(),
 				elastic:   api.EmptyResource(),
 				inqueue:   api.EmptyResource(),
@@ -148,6 +150,11 @@ func (pp *proportionPlugin) OnSessionOpen(ssn *framework.Session) {
 					attr.allocated.Add(t.Resreq)
 					attr.request.Add(t.Resreq)
 				}
+			} else if status == api.Pipelined {
+				for _, t := range tasks {
+					attr.pipelined.Add(t.Resreq)
+					attr.request.Add(t.Resreq)
+				}
 			} else if status == api.Pending {
 				for _, t := range tasks {
 					attr.request.Add(t.Resreq)
@@ -170,8 +177,8 @@ func (pp *proportionPlugin) OnSessionOpen(ssn *framework.Session) {
 			attr.inqueue.Add(job.DeductSchGatedResources(inqueued))
 		}
 		attr.elastic.Add(job.GetElasticResources())
-		klog.V(5).Infof("Queue %s allocated <%s> request <%s> inqueue <%s> elastic <%s>",
-			attr.name, attr.allocated.String(), attr.request.String(), attr.inqueue.String(), attr.elastic.String())
+		klog.V(5).Infof("Queue %s allocated <%s> pipelined <%s> request <%s> inqueue <%s> elastic <%s>",
+			attr.name, attr.allocated.String(), attr.pipelined.String(), attr.request.String(), attr.inqueue.String(), attr.elastic.String())
 	}
 
 	// Record metrics
@@ -236,8 +243,8 @@ func (pp *proportionPlugin) OnSessionOpen(ssn *framework.Session) {
 				klog.V(4).Infof("queue <%s> is meet cause of the capability", attr.name)
 			}
 
-			klog.V(4).Infof("The attributes of queue <%s> in proportion: deserved <%v>, realCapability <%v>, allocate <%v>, request <%v>, elastic <%v>, share <%0.2f>",
-				attr.name, attr.deserved, attr.realCapability, attr.allocated, attr.request, attr.elastic, attr.share)
+			klog.V(4).Infof("The attributes of queue <%s> in proportion: deserved <%v>, realCapability <%v>, allocated <%v>, pipelined <%v>, request <%v>, elastic <%v>, share <%0.2f>",
+				attr.name, attr.deserved, attr.realCapability, attr.allocated, attr.pipelined, attr.request, attr.elastic, attr.share)
 
 			increased, decreased := attr.deserved.Diff(oldDeserved, api.Zero)
 			increasedDeserved.Add(increased)
@@ -301,11 +308,12 @@ func (pp *proportionPlugin) OnSessionOpen(ssn *framework.Session) {
 		queue := obj.(*api.QueueInfo)
 		attr := pp.queueOpts[queue.UID]
 
-		overused := attr.deserved.LessEqual(attr.allocated, api.Zero)
+		used := attr.used()
+		overused := attr.deserved.LessEqual(used, api.Zero)
 		metrics.UpdateQueueOverused(attr.name, overused)
 		if overused {
-			klog.V(3).Infof("Queue <%v>: deserved <%v>, allocated <%v>, share <%v>",
-				queue.Name, attr.deserved, attr.allocated, attr.share)
+			klog.V(3).Infof("Queue <%v>: deserved <%v>, allocated <%v>, pipelined <%v>, used <%v>, share <%v>",
+				queue.Name, attr.deserved, attr.allocated, attr.pipelined, used, attr.share)
 		}
 
 		return overused
@@ -318,11 +326,12 @@ func (pp *proportionPlugin) OnSessionOpen(ssn *framework.Session) {
 		}
 
 		attr := pp.queueOpts[queue.UID]
-		futureUsed := attr.allocated.Clone().Add(candidate.Resreq)
+		currentUsed := attr.used()
+		futureUsed := currentUsed.Clone().Add(candidate.Resreq)
 		allocatable := futureUsed.LessEqualWithDimension(attr.deserved, candidate.Resreq)
 		if !allocatable {
-			klog.V(3).Infof("Queue <%v>: deserved <%v>, allocated <%v>; Candidate <%v>: resource request <%v>",
-				queue.Name, attr.deserved, attr.allocated, candidate.Name, candidate.Resreq)
+			klog.V(3).Infof("Queue <%v>: deserved <%v>, allocated <%v>, pipelined <%v>, used <%v>; Candidate <%v>: resource request <%v>",
+				queue.Name, attr.deserved, attr.allocated, attr.pipelined, currentUsed, candidate.Name, candidate.Resreq)
 		}
 
 		return allocatable
@@ -344,11 +353,12 @@ func (pp *proportionPlugin) OnSessionOpen(ssn *framework.Session) {
 			return false
 		}
 
-		futureUsed := attr.allocated.Clone().Add(candidate.Resreq)
+		currentUsed := attr.used()
+		futureUsed := currentUsed.Clone().Add(candidate.Resreq)
 		allocatable := futureUsed.LessEqualWithDimension(attr.deserved, candidate.Resreq)
 		if !allocatable {
-			klog.V(3).Infof("Queue <%v>: deserved <%v>, allocated <%v>; Candidate <%v>: resource request <%v>",
-				queue.Name, attr.deserved, attr.allocated, candidate.Name, candidate.Resreq)
+			klog.V(3).Infof("Queue <%v>: deserved <%v>, allocated <%v>, pipelined <%v>, used <%v>; Candidate <%v>: resource request <%v>",
+				queue.Name, attr.deserved, attr.allocated, attr.pipelined, currentUsed, candidate.Name, candidate.Resreq)
 		}
 
 		return allocatable
@@ -397,10 +407,10 @@ func (pp *proportionPlugin) OnSessionOpen(ssn *framework.Session) {
 		}
 		minReq := job.GetMinResources()
 
-		klog.V(5).Infof("job %s min resource <%s>, queue %s capability <%s> allocated <%s> inqueue <%s> elastic <%s>",
-			job.Name, minReq.String(), queue.Name, attr.realCapability.String(), attr.allocated.String(), attr.inqueue.String(), attr.elastic.String())
+		klog.V(5).Infof("job %s min resource <%s>, queue %s capability <%s> allocated <%s> pipelined <%s> inqueue <%s> elastic <%s>",
+			job.Name, minReq.String(), queue.Name, attr.realCapability.String(), attr.allocated.String(), attr.pipelined.String(), attr.inqueue.String(), attr.elastic.String())
 		// The queue resource quota limit has not reached
-		r := minReq.Clone().Add(attr.allocated).Add(attr.inqueue).Sub(attr.elastic)
+		r := minReq.Clone().Add(attr.used()).Add(attr.inqueue).Sub(attr.elastic)
 
 		inqueue := r.LessEqualWithDimension(attr.realCapability, minReq)
 		klog.V(5).Infof("job %s inqueue %v", job.Name, inqueue)
@@ -451,24 +461,32 @@ func (pp *proportionPlugin) OnSessionOpen(ssn *framework.Session) {
 		AllocateFunc: func(event *framework.Event) {
 			job := ssn.Jobs[event.Task.Job]
 			attr := pp.queueOpts[job.Queue]
-			attr.allocated.Add(event.Task.Resreq)
-			metrics.UpdateQueueAllocated(attr.name, attr.allocated.MilliCPU, attr.allocated.Memory, attr.allocated.ScalarResources)
+			if event.Operation == framework.EventPipeline {
+				attr.pipelined.Add(event.Task.Resreq)
+			} else {
+				attr.allocated.Add(event.Task.Resreq)
+				metrics.UpdateQueueAllocated(attr.name, attr.allocated.MilliCPU, attr.allocated.Memory, attr.allocated.ScalarResources)
+			}
 
 			pp.updateShare(attr)
 
-			klog.V(4).Infof("Proportion AllocateFunc: task <%v/%v>, resreq <%v>,  share <%v>",
-				event.Task.Namespace, event.Task.Name, event.Task.Resreq, attr.share)
+			klog.V(4).Infof("Proportion AllocateFunc: task <%v/%v>, operation <%s>, resreq <%v>, allocated <%v>, pipelined <%v>, share <%v>",
+				event.Task.Namespace, event.Task.Name, event.Operation, event.Task.Resreq, attr.allocated, attr.pipelined, attr.share)
 		},
 		DeallocateFunc: func(event *framework.Event) {
 			job := ssn.Jobs[event.Task.Job]
 			attr := pp.queueOpts[job.Queue]
-			attr.allocated.Sub(event.Task.Resreq)
-			metrics.UpdateQueueAllocated(attr.name, attr.allocated.MilliCPU, attr.allocated.Memory, attr.allocated.ScalarResources)
+			if event.Operation == framework.EventUnPipeline {
+				attr.pipelined.Sub(event.Task.Resreq)
+			} else {
+				attr.allocated.Sub(event.Task.Resreq)
+				metrics.UpdateQueueAllocated(attr.name, attr.allocated.MilliCPU, attr.allocated.Memory, attr.allocated.ScalarResources)
+			}
 
 			pp.updateShare(attr)
 
-			klog.V(4).Infof("Proportion EvictFunc: task <%v/%v>, resreq <%v>,  share <%v>",
-				event.Task.Namespace, event.Task.Name, event.Task.Resreq, attr.share)
+			klog.V(4).Infof("Proportion EvictFunc: task <%v/%v>, operation <%s>, resreq <%v>, allocated <%v>, pipelined <%v>, share <%v>",
+				event.Task.Namespace, event.Task.Name, event.Operation, event.Task.Resreq, attr.allocated, attr.pipelined, attr.share)
 		},
 	})
 }
@@ -482,6 +500,20 @@ func (pp *proportionPlugin) OnSessionClose(ssn *framework.Session) {
 func (pp *proportionPlugin) updateShare(attr *queueAttr) {
 	updateQueueAttrShare(attr)
 	metrics.UpdateQueueShare(attr.name, attr.share)
+}
+
+func (qa *queueAttr) used() *api.Resource {
+	used := api.EmptyResource()
+	if qa == nil {
+		return used
+	}
+	if qa.allocated != nil {
+		used.Add(qa.allocated)
+	}
+	if qa.pipelined != nil {
+		used.Add(qa.pipelined)
+	}
+	return used
 }
 
 type proportionState struct {
@@ -502,6 +534,7 @@ func (qa *queueAttr) Clone() *queueAttr {
 
 		deserved:       qa.deserved.Clone(),
 		allocated:      qa.allocated.Clone(),
+		pipelined:      qa.pipelined.Clone(),
 		request:        qa.request.Clone(),
 		elastic:        qa.elastic.Clone(),
 		inqueue:        qa.inqueue.Clone(),
@@ -544,10 +577,11 @@ func getProportionState(cycleState *k8sframework.CycleState) (*proportionState, 
 
 func updateQueueAttrShare(attr *queueAttr) {
 	res := float64(0)
+	used := attr.used()
 
 	// TODO(k82cn): how to handle fragment issues?
 	for _, rn := range attr.deserved.ResourceNames() {
-		share := helpers.Share(attr.allocated.Get(rn), attr.deserved.Get(rn))
+		share := helpers.Share(used.Get(rn), attr.deserved.Get(rn))
 		if share > res {
 			res = share
 		}

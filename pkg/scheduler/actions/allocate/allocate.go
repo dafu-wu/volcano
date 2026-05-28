@@ -160,20 +160,22 @@ func (alloc *Action) allocateResources(queues *util.PriorityQueue, jobsMap map[a
 		job := jobs.Pop().(*api.JobInfo)
 		if _, found = pendingTasks[job.UID]; !found {
 			tasks := util.NewPriorityQueue(ssn.TaskOrderFn)
-			for _, task := range job.TaskStatusIndex[api.Pending] {
-				// Skip tasks whose pod are scheduling gated
-				if task.SchGated {
-					continue
-				}
+			for _, status := range []api.TaskStatus{api.Pipelined, api.Pending} {
+				for _, task := range job.TaskStatusIndex[status] {
+					// Skip tasks whose pod are scheduling gated
+					if task.SchGated {
+						continue
+					}
 
-				// Skip BestEffort task in 'allocate' action.
-				if task.Resreq.IsEmpty() {
-					klog.V(4).Infof("Task <%v/%v> is BestEffort task, skip it.",
-						task.Namespace, task.Name)
-					continue
-				}
+					// Skip BestEffort task in 'allocate' action.
+					if task.Resreq.IsEmpty() {
+						klog.V(4).Infof("Task <%v/%v> is BestEffort task, skip it.",
+							task.Namespace, task.Name)
+						continue
+					}
 
-				tasks.Push(task)
+					tasks.Push(task)
+				}
 			}
 			pendingTasks[job.UID] = tasks
 		}
@@ -368,14 +370,36 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 
 	for !tasks.Empty() {
 		task := tasks.Pop().(*api.TaskInfo)
+		skipNominatedNode := false
+		restorePipelinedNode := ""
+		if task.Status == api.Pipelined {
+			var prepared bool
+			prepared, skipNominatedNode, restorePipelinedNode = alloc.preparePipelinedTask(stmt, task)
+			if !prepared {
+				continue
+			}
+		}
+		restorePipelinedTask := func(reason string) {
+			if restorePipelinedNode == "" {
+				return
+			}
+			alloc.restorePreparedPipelinedTask(stmt, task, restorePipelinedNode, reason)
+			restorePipelinedNode = ""
+		}
+
 		if !ssn.Allocatable(queue, task) {
 			klog.V(3).Infof("Queue <%s> is overused when considering task <%s>, ignore it.", queue.Name, task.Name)
+			// A queue-overused result means the existing reservation is no longer
+			// legal under current quota accounting. Do not restore it here; letting
+			// the task fall back to Pending clears stale nominatedNodeName state and
+			// prevents old partial gang reservations from blocking real idle nodes.
 			continue
 		}
 
 		// check if the task with its spec has already predicates failed
 		if job.TaskHasFitErrors(task) {
 			klog.V(5).Infof("Task %s with role spec %s has already predicated failed, skip", task.Name, task.TaskRole)
+			restorePipelinedTask("cached fit errors")
 			continue
 		}
 
@@ -388,6 +412,7 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 				fitErrors.SetNodeError(ni.Name, err)
 			}
 			job.NodesFitErrors[task.UID] = fitErrors
+			restorePipelinedTask("pre-predicate failure")
 			break
 		}
 
@@ -396,7 +421,7 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 
 		// "NominatedNodeName" can potentially be set in a previous scheduling cycle as a result of preemption.
 		// This node is likely the only candidate that will fit the pod, and hence we try it first before iterating over all nodes.
-		if len(task.Pod.Status.NominatedNodeName) > 0 {
+		if !skipNominatedNode && len(task.Pod.Status.NominatedNodeName) > 0 {
 			if nominatedNodeInfo, ok := ssn.Nodes[task.Pod.Status.NominatedNodeName]; ok && task.InitResreq.LessEqual(nominatedNodeInfo.FutureIdle(), api.Zero) {
 				predicateNodes, fitErrors = ph.PredicateNodes(task, []*api.NodeInfo{nominatedNodeInfo}, alloc.predicate, alloc.enablePredicateErrorCache)
 			}
@@ -419,8 +444,10 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 			// so we should break from continuously allocating.
 			// otherwise, should continue to find other allocatable task
 			if job.NeedContinueAllocating() {
+				restorePipelinedTask("predicate failure")
 				continue
 			} else {
+				restorePipelinedTask("predicate failure")
 				break
 			}
 		}
@@ -431,6 +458,7 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 
 		bestNode, highestScore := alloc.prioritizeNodes(ssn, task, predicateNodes)
 		if bestNode == nil {
+			restorePipelinedTask("no best node")
 			continue
 		}
 
@@ -438,6 +466,8 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 
 		if err := alloc.allocateResourcesForTask(stmt, task, bestNode, job); err == nil {
 			jobNewAllocatedHyperNode = getJobNewAllocatedHyperNode(ssn, bestNode.Name, job, jobNewAllocatedHyperNode)
+		} else {
+			restorePipelinedTask("allocation failure")
 		}
 
 		if ssn.JobReady(job) && !tasks.Empty() {
@@ -453,6 +483,7 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 		if !ssn.JobPipelined(job) {
 			stmt.Discard()
 		} else {
+			stmt.DiscardAllocations()
 			// When JobPipelined=true but not Ready, we preserve the Pipelined state
 			// (for reclaim/preempt visibility and event reporting), but we must clean up
 			// DRA inFlightAllocations to prevent leaks across jobs in the same session.
@@ -587,7 +618,7 @@ func (alloc *Action) allocateResourcesForTask(stmt *framework.Statement, task *a
 	if task.InitResreq.LessEqual(node.FutureIdle(), api.Zero) {
 		klog.V(3).Infof("Pipelining Task <%v/%v> to node <%v> for <%v> on <%v>",
 			task.Namespace, task.Name, node.Name, task.InitResreq, node.Releasing)
-		if err = stmt.Pipeline(task, node.Name, false); err != nil {
+		if err = stmt.Pipeline(task, node.Name, true); err != nil {
 			klog.Errorf("Failed to pipeline Task %v on %v in Session %v for %v.",
 				task.UID, node.Name, alloc.session.UID, err)
 		} else {
@@ -596,6 +627,58 @@ func (alloc *Action) allocateResourcesForTask(stmt *framework.Statement, task *a
 		}
 	}
 	return
+}
+
+func (alloc *Action) preparePipelinedTask(stmt *framework.Statement, task *api.TaskInfo) (bool, bool, string) {
+	if task.Status != api.Pipelined {
+		return true, false, ""
+	}
+
+	node, found := alloc.session.Nodes[task.NodeName]
+	if !found {
+		originalNodeName := task.NodeName
+		klog.V(3).Infof("Pipelined Task <%s/%s> nominated node <%s> no longer exists, unpipeline and retry scheduling.",
+			task.Namespace, task.Name, originalNodeName)
+		if err := stmt.UnPipeline(task); err != nil {
+			klog.Errorf("Failed to unpipeline Task <%s/%s> from missing node <%s>: %v",
+				task.Namespace, task.Name, originalNodeName, err)
+			return false, false, ""
+		}
+		return true, true, ""
+	}
+
+	originalNodeName := node.Name
+	if !task.InitResreq.LessEqual(node.Idle, api.Zero) {
+		klog.V(3).Infof("Pipelined Task <%s/%s> on Node <%s> still waits for idle <%v> to satisfy <%v>, retry scheduling across all nodes.",
+			task.Namespace, task.Name, node.Name, node.Idle, task.InitResreq)
+		if err := stmt.UnPipeline(task); err != nil {
+			klog.Errorf("Failed to unpipeline Task <%s/%s> on Node <%s> before retry: %v",
+				task.Namespace, task.Name, node.Name, err)
+			return false, false, ""
+		}
+		return true, true, originalNodeName
+	}
+
+	klog.V(3).Infof("Pipelined Task <%s/%s> on Node <%s> now has idle resource, retry binding.",
+		task.Namespace, task.Name, node.Name)
+	if err := stmt.UnPipeline(task); err != nil {
+		klog.Errorf("Failed to unpipeline Task <%s/%s> on Node <%s> before binding: %v",
+			task.Namespace, task.Name, node.Name, err)
+		return false, false, ""
+	}
+	return true, false, originalNodeName
+}
+
+func (alloc *Action) restorePreparedPipelinedTask(stmt *framework.Statement, task *api.TaskInfo, nodeName, reason string) {
+	if nodeName == "" || task.Status != api.Pending || task.NodeName != "" {
+		return
+	}
+	klog.V(3).Infof("Restoring Pipelined Task <%s/%s> to Node <%s> after %s.",
+		task.Namespace, task.Name, nodeName, reason)
+	if err := stmt.Pipeline(task, nodeName, true); err != nil {
+		klog.Errorf("Failed to restore Pipelined Task <%s/%s> on Node <%s> after %s: %v",
+			task.Namespace, task.Name, nodeName, reason, err)
+	}
 }
 
 func (alloc *Action) predicate(task *api.TaskInfo, node *api.NodeInfo) error {

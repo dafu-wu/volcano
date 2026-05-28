@@ -25,6 +25,25 @@ import (
 )
 
 // EventOperation describes the scheduler state transition that raised an event.
+//
+// Event operations form two symmetric pairs that drive plugin/event handlers:
+//
+//   - Allocate  <-> Deallocate : real allocation lifecycle. Allocate is fired
+//     when a task is assigned to a node and may later be bound; Deallocate is
+//     fired when a real allocation is rolled back (e.g. statement discard) or
+//     released (e.g. evict). Both carry ExternalResources=true so that handlers
+//     run external side effects such as DRA/volume Reserve/Unreserve and device
+//     Allocate/Release.
+//
+//   - Pipeline <-> UnPipeline : scheduler-internal future reservation against
+//     releasing resources. These do NOT touch external resources, so handlers
+//     must keep ExternalResources=false. UnPipeline is also used to roll back a
+//     Pipeline reservation.
+//
+// Note that Statement.unevict (used by reclaim/preempt rollback) emits
+// EventAllocate with ExternalResources=true, which is the correct counter-event
+// for an earlier Evict (a real release): it must re-Reserve DRA claims and
+// re-Allocate devices.
 type EventOperation string
 
 const (

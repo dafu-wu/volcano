@@ -1006,12 +1006,14 @@ func (sc *SchedulerCache) taskUnschedulable(task *schedulingapi.TaskInfo, reason
 
 	updateCond := podConditionHaveUpdate(&pod.Status, condition)
 
-	// only update pod's nominatedNodeName when nominatedNodeName is not empty
+	// Normally only update pod's nominatedNodeName when nominatedNodeName is not empty
 	// consider this situation:
 	// 1. at session 1, the pod A preempt another lower priority pod B, and we updated A's nominatedNodeName
 	// 2. at session 2, the pod B is still terminating, so the pod A is still pipelined, but it preempt none, so
-	// the nominatedNodeName is empty, but we should not override the A's nominatedNodeName to empty
-	updateNomiNode := len(nominatedNodeName) > 0 && podNominatedNodeNameNeedUpdate(&pod.Status, nominatedNodeName)
+	// the nominatedNodeName is empty, but we should not override the A's nominatedNodeName to empty.
+	// If the task is no longer pipelined, an empty nominatedNodeName means the old API status is stale and should be cleared.
+	updateNomiNode := (len(nominatedNodeName) > 0 || task.Status != schedulingapi.Pipelined) &&
+		podNominatedNodeNameNeedUpdate(&pod.Status, nominatedNodeName)
 
 	if updateCond || updateNomiNode {
 		pod = pod.DeepCopy()
@@ -1212,7 +1214,7 @@ func (sc *SchedulerCache) processSyncHyperNode() {
 }
 
 // AddBindTask add task to be bind to a cache which consumes by go runtime
-func (sc *SchedulerCache) AddBindTask(bindContext *BindContext) error {
+func (sc *SchedulerCache) AddBindTask(bindContext *BindContext) (err error) {
 	klog.V(5).Infof("add bind task %v/%v", bindContext.TaskInfo.Namespace, bindContext.TaskInfo.Name)
 	sc.Mutex.Lock()
 	defer sc.Mutex.Unlock()
@@ -1228,12 +1230,57 @@ func (sc *SchedulerCache) AddBindTask(bindContext *BindContext) error {
 	}
 
 	originalStatus := task.Status
+	originalNodeName := task.NodeName
+	var pipelinedReservationNode *schedulingapi.NodeInfo
+	if originalStatus == schedulingapi.Pipelined && originalNodeName != "" {
+		if oldNode, found := sc.Nodes[originalNodeName]; found {
+			if err := oldNode.RemoveTask(task); err != nil {
+				return err
+			}
+			pipelinedReservationNode = oldNode
+		}
+		task.NodeName = ""
+	}
+	restoredOriginalState := false
+	restoreOriginalState := func(context string) bool {
+		if restoredOriginalState {
+			return true
+		}
+		restoredOriginalState = true
+		if originalStatus == schedulingapi.Pipelined {
+			task.NodeName = originalNodeName
+		}
+		if rollbackErr := job.UpdateTaskStatus(task, originalStatus); rollbackErr != nil {
+			klog.Errorf("Failed to rollback task <%s/%s> status from %s to %s after %s: %v",
+				task.Namespace, task.Name, task.Status, originalStatus, context, rollbackErr)
+			sc.resyncTask(task)
+			return false
+		}
+		if pipelinedReservationNode != nil {
+			if restoreErr := pipelinedReservationNode.AddTask(task); restoreErr != nil {
+				klog.Errorf("Failed to restore pipelined task <%s/%s> on Node <%s> after %s: %v",
+					task.Namespace, task.Name, pipelinedReservationNode.Name, context, restoreErr)
+				sc.resyncTask(task)
+				return false
+			}
+		}
+		return true
+	}
+
 	if err := job.UpdateTaskStatus(task, schedulingapi.Binding); err != nil {
+		restoreOriginalState("binding status error")
 		return err
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			restoreOriginalState("panic while adding bind task")
+			err = fmt.Errorf("add bind task %s/%s panic: %v", task.Namespace, task.Name, r)
+		}
+	}()
 
 	err = bindContext.TaskInfo.SetPodResourceDecision()
 	if err != nil {
+		restoreOriginalState("resource decision error")
 		return fmt.Errorf("set task %v/%v resource decision failed, err %v", task.Namespace, task.Name, err)
 	}
 	task.NumaInfo = bindContext.TaskInfo.NumaInfo.Clone()
@@ -1242,12 +1289,7 @@ func (sc *SchedulerCache) AddBindTask(bindContext *BindContext) error {
 	if err := node.AddTask(task); err != nil {
 		// After failing to update task to a node we need to revert task status from Releasing,
 		// otherwise task might be stuck in the Releasing state indefinitely.
-		if err := job.UpdateTaskStatus(task, originalStatus); err != nil {
-			klog.Errorf("Task <%s/%s> will be resynchronized after failing to revert status "+
-				"from %s to %s after failing to update Task on Node <%s>: %v",
-				task.Namespace, task.Name, task.Status, originalStatus, node.Name, err)
-			sc.resyncTask(task)
-		}
+		restoreOriginalState(fmt.Sprintf("node %s add task error", node.Name))
 		return err
 	}
 

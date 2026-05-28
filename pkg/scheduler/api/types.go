@@ -288,11 +288,24 @@ func (s StatusSets) ContainsDRAClaimAllocationFailure() bool {
 	return false
 }
 
+// draDynamicResourcesPluginName is the name of the upstream kube-scheduler
+// DynamicResources plugin that owns DRA claim allocation.
+const draDynamicResourcesPluginName = "DynamicResources"
+
+// draClaimAllocationFailureMarker is the substring used by upstream
+// kube-scheduler v1.31+ DynamicResources plugin to report that a node cannot
+// satisfy all ResourceClaim allocations. It is matched against status.Reason
+// because the upstream plugin does not expose a typed error code for this
+// case. TODO: replace with a typed marker when kube-scheduler exposes one.
+//
+// Source reference (upstream): pkg/scheduler/framework/plugins/dynamicresources.
+const draClaimAllocationFailureMarker = "cannot allocate all claims"
+
 func isDRAClaimAllocationFailure(status *Status) bool {
 	return status != nil &&
 		status.Code == UnschedulableAndUnresolvable &&
-		status.Plugin == "DynamicResources" &&
-		strings.Contains(status.Reason, "cannot allocate all claims")
+		status.Plugin == draDynamicResourcesPluginName &&
+		strings.Contains(status.Reason, draClaimAllocationFailureMarker)
 }
 
 // Message return the message generated from StatusSets

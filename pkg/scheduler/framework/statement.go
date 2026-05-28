@@ -426,6 +426,30 @@ func (s *Statement) Discard() {
 	}
 }
 
+// DiscardAllocations rolls back scheduler-internal Allocate operations while
+// preserving Pipeline operations that are still needed to wait for victims.
+func (s *Statement) DiscardAllocations() {
+	klog.V(3).Info("Discarding allocate operations ...")
+	for i := len(s.operations) - 1; i >= 0; i-- {
+		op := s.operations[i]
+		if op.name != Allocate {
+			continue
+		}
+		op.task.GenerateLastTxContext()
+		if err := s.unallocate(op.task); err != nil {
+			klog.Errorf("Failed to unallocate task: %s", err.Error())
+		}
+	}
+
+	retained := s.operations[:0]
+	for _, op := range s.operations {
+		if op.name != Allocate {
+			retained = append(retained, op)
+		}
+	}
+	s.operations = retained
+}
+
 // Commit operation for evict and pipeline
 func (s *Statement) Commit() {
 	klog.V(3).Info("Committing operations ...")

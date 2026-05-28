@@ -253,7 +253,7 @@ func updateQueueStatus(ssn *Session) {
 	}
 	for _, job := range ssn.Jobs {
 		for status, tasks := range job.TaskStatusIndex {
-			if api.AllocatedStatus(status) {
+			if queueAllocatedStatus(status) {
 				for _, task := range tasks {
 					allocatedResources[job.Queue].Add(task.Resreq)
 					// recursively updates the allocated resources of parent queues
@@ -296,6 +296,15 @@ func updateQueueStatus(ssn *Session) {
 		if err := ssn.cache.UpdateQueueStatus(ssn.Queues[queueID]); err != nil {
 			klog.Errorf("failed to update queue <%s> status: %s", ssn.Queues[queueID].Name, err.Error())
 		}
+	}
+}
+
+func queueAllocatedStatus(status api.TaskStatus) bool {
+	switch status {
+	case api.Bound, api.Binding, api.Running:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -514,6 +523,7 @@ func (ssn *Session) Pipeline(task *api.TaskInfo, hostname string) error {
 	}
 
 	task.NodeName = hostname
+	task.EvictionOccurred = true
 
 	if node, found := ssn.Nodes[hostname]; found {
 		if err := node.AddTask(task); err != nil {

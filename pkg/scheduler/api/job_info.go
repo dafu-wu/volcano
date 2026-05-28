@@ -189,6 +189,14 @@ func NewTaskInfo(pod *v1.Pod) *TaskInfo {
 	// initialize pod scheduling gates info here since it will not change in a scheduling cycle
 	schGated := calSchedulingGated(pod)
 	jobID := getJobID(pod)
+	status := getTaskStatus(pod)
+	nodeName := pod.Spec.NodeName
+	evictionOccurred := false
+	if status == Pending && pod.Status.NominatedNodeName != "" {
+		status = Pipelined
+		nodeName = pod.Status.NominatedNodeName
+		evictionOccurred = true
+	}
 
 	ti := &TaskInfo{
 		UID:                         TaskID(pod.UID),
@@ -207,8 +215,9 @@ func NewTaskInfo(pod *v1.Pod) *TaskInfo {
 		NumaInfo:                    topologyInfo,
 		SchGated:                    schGated,
 		TransactionContext: TransactionContext{
-			NodeName: pod.Spec.NodeName,
-			Status:   getTaskStatus(pod),
+			NodeName:         nodeName,
+			EvictionOccurred: evictionOccurred,
+			Status:           status,
 		},
 	}
 
@@ -254,6 +263,9 @@ func calSchedulingGated(pod *v1.Pod) bool {
 func (ti *TaskInfo) SetPodResourceDecision() error {
 	if ti.NumaInfo == nil || len(ti.NumaInfo.ResMap) == 0 {
 		return nil
+	}
+	if ti.Pod == nil {
+		return fmt.Errorf("pod is nil")
 	}
 
 	klog.V(4).Infof("%v/%v resource decision: %v", ti.Namespace, ti.Name, ti.NumaInfo.ResMap)

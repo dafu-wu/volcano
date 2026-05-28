@@ -310,6 +310,174 @@ func TestNodeOperation(t *testing.T) {
 	}
 }
 
+// TestSchedulerCache_Bind_PipelinedTaskMovesReservation verifies that when a
+// task is bound from Pipelined state on one node to a different target node,
+// the pipelined reservation is removed from the original node and the task is
+// added to the new node.
+func TestSchedulerCache_Bind_PipelinedTaskMovesReservation(t *testing.T) {
+	owner := buildOwnerReference("j1")
+
+	cache := &SchedulerCache{
+		Jobs:            make(map[api.JobID]*api.JobInfo),
+		Nodes:           make(map[string]*api.NodeInfo),
+		Binder:          util.NewFakeBinder(0),
+		BindFlowChannel: make(chan *BindContext, 5000),
+	}
+
+	pod := buildPod("c1", "p1", "", v1.PodPending, api.BuildResourceList("1000m", "1G"),
+		[]metav1.OwnerReference{owner}, make(map[string]string))
+	cache.AddPod(pod)
+
+	oldNode := buildNode("n-old", api.BuildResourceList("2000m", "10G", []api.ScalarResource{{Name: "pods", Value: "10"}}...))
+	newNode := buildNode("n-new", api.BuildResourceList("2000m", "10G", []api.ScalarResource{{Name: "pods", Value: "10"}}...))
+	cache.AddOrUpdateNode(oldNode)
+	cache.AddOrUpdateNode(newNode)
+
+	task := api.NewTaskInfo(pod)
+	task.Job = "j1"
+	if err := cache.addTask(task); err != nil {
+		t.Fatalf("failed to add task: %v", err)
+	}
+
+	// Simulate a Pipelined reservation on the old node.
+	task.NodeName = "n-old"
+	job := cache.Jobs[task.Job]
+	if err := job.UpdateTaskStatus(task, api.Pipelined); err != nil {
+		t.Fatalf("failed to set task to Pipelined: %v", err)
+	}
+	if err := cache.Nodes["n-old"].AddTask(task); err != nil {
+		t.Fatalf("failed to add pipelined task to old node: %v", err)
+	}
+
+	// Now bind the task to a different node.
+	bindCtxTask := task.Clone()
+	bindCtxTask.NodeName = "n-new"
+	bindContext := &BindContext{TaskInfo: bindCtxTask}
+	if err := cache.AddBindTask(bindContext); err != nil {
+		t.Fatalf("AddBindTask failed: %v", err)
+	}
+
+	taskKey := api.PodKey(pod)
+	if _, ok := cache.Nodes["n-old"].Tasks[taskKey]; ok {
+		t.Errorf("expected pipelined reservation to be removed from old node n-old")
+	}
+	if _, ok := cache.Nodes["n-new"].Tasks[taskKey]; !ok {
+		t.Errorf("expected task to be present on new node n-new after bind")
+	}
+}
+
+// TestSchedulerCache_Bind_PipelinedRollbackOnSetPodResourceDecisionFailure
+// covers the failure path where SetPodResourceDecision fails after the task
+// was already transitioned to Binding. The pipelined reservation on the
+// original node must be restored and the task status must be rolled back.
+func TestSchedulerCache_Bind_PipelinedRollbackOnSetPodResourceDecisionFailure(t *testing.T) {
+	owner := buildOwnerReference("j1")
+
+	cache := &SchedulerCache{
+		Jobs:            make(map[api.JobID]*api.JobInfo),
+		Nodes:           make(map[string]*api.NodeInfo),
+		Binder:          util.NewFakeBinder(0),
+		BindFlowChannel: make(chan *BindContext, 5000),
+	}
+
+	pod := buildPod("c1", "p1", "", v1.PodPending, api.BuildResourceList("1000m", "1G"),
+		[]metav1.OwnerReference{owner}, make(map[string]string))
+	cache.AddPod(pod)
+
+	oldNode := buildNode("n-old", api.BuildResourceList("2000m", "10G", []api.ScalarResource{{Name: "pods", Value: "10"}}...))
+	newNode := buildNode("n-new", api.BuildResourceList("2000m", "10G", []api.ScalarResource{{Name: "pods", Value: "10"}}...))
+	cache.AddOrUpdateNode(oldNode)
+	cache.AddOrUpdateNode(newNode)
+
+	task := api.NewTaskInfo(pod)
+	task.Job = "j1"
+	if err := cache.addTask(task); err != nil {
+		t.Fatalf("failed to add task: %v", err)
+	}
+	task.NodeName = "n-old"
+	job := cache.Jobs[task.Job]
+	if err := job.UpdateTaskStatus(task, api.Pipelined); err != nil {
+		t.Fatalf("failed to set task to Pipelined: %v", err)
+	}
+	if err := cache.Nodes["n-old"].AddTask(task); err != nil {
+		t.Fatalf("failed to add pipelined task to old node: %v", err)
+	}
+
+	bindCtxTask := task.Clone()
+	bindCtxTask.NodeName = "n-new"
+	bindCtxTask.NumaInfo = &api.TopologyInfo{
+		Policy: "single-numa-node",
+		ResMap: map[int]v1.ResourceList{
+			0: api.BuildResourceList("500m", "256Mi"),
+		},
+	}
+	bindCtxTask.Pod = nil
+
+	bindContext := &BindContext{TaskInfo: bindCtxTask}
+	if err := cache.AddBindTask(bindContext); err == nil {
+		t.Fatalf("expected AddBindTask to fail")
+	}
+
+	taskKey := api.PodKey(pod)
+	if _, ok := cache.Nodes["n-new"].Tasks[taskKey]; ok {
+		t.Errorf("expected task NOT to be on new node after rollback")
+	}
+	if _, ok := cache.Nodes["n-old"].Tasks[taskKey]; !ok {
+		t.Errorf("expected pipelined reservation to be restored on old node")
+	}
+	if task.Status != api.Pipelined {
+		t.Errorf("expected task status to be rolled back to Pipelined, got %v", task.Status)
+	}
+}
+
+func TestTaskUnschedulableClearsStaleNominatedNodeName(t *testing.T) {
+	updater := &recordingStatusUpdater{}
+	cache := &SchedulerCache{
+		Recorder:      record.NewFakeRecorder(10),
+		StatusUpdater: updater,
+	}
+
+	pod := buildPod("c1", "p1", "", v1.PodPending, api.BuildResourceList("1000m", "1G"), nil, nil)
+	pod.Status.NominatedNodeName = "stale-node"
+	task := api.NewTaskInfo(pod)
+	task.Status = api.Pending
+	task.NodeName = ""
+
+	if err := cache.taskUnschedulable(task, api.PodReasonUnschedulable, "no fit", ""); err != nil {
+		t.Fatalf("taskUnschedulable failed: %v", err)
+	}
+	if updater.pod == nil {
+		t.Fatalf("expected pod status to be updated")
+	}
+	if got := updater.pod.Status.NominatedNodeName; got != "" {
+		t.Fatalf("nominatedNodeName = %q, want cleared", got)
+	}
+}
+
+func TestTaskUnschedulablePreservesPipelinedNominatedNodeName(t *testing.T) {
+	updater := &recordingStatusUpdater{}
+	cache := &SchedulerCache{
+		Recorder:      record.NewFakeRecorder(10),
+		StatusUpdater: updater,
+	}
+
+	pod := buildPod("c1", "p1", "", v1.PodPending, api.BuildResourceList("1000m", "1G"), nil, nil)
+	pod.Status.NominatedNodeName = "reserved-node"
+	task := api.NewTaskInfo(pod)
+	task.Status = api.Pipelined
+	task.NodeName = "reserved-node"
+
+	if err := cache.taskUnschedulable(task, api.PodReasonUnschedulable, "waiting", ""); err != nil {
+		t.Fatalf("taskUnschedulable failed: %v", err)
+	}
+	if updater.pod == nil {
+		t.Fatalf("expected pod status to be updated")
+	}
+	if got := updater.pod.Status.NominatedNodeName; got != "reserved-node" {
+		t.Fatalf("nominatedNodeName = %q, want preserved", got)
+	}
+}
+
 func TestBindTasks(t *testing.T) {
 	owner := buildOwnerReference("j1")
 	scheduler := "fake-scheduler"
@@ -424,4 +592,21 @@ func (m *mockPreBinder) PreBind(ctx context.Context, bindCtx *BindContext) error
 
 func (m *mockPreBinder) PreBindRollBack(ctx context.Context, bindCtx *BindContext) {
 	// do nothing
+}
+
+type recordingStatusUpdater struct {
+	pod *v1.Pod
+}
+
+func (r *recordingStatusUpdater) UpdatePodStatus(pod *v1.Pod) (*v1.Pod, error) {
+	r.pod = pod.DeepCopy()
+	return pod, nil
+}
+
+func (r *recordingStatusUpdater) UpdatePodGroup(pg *api.PodGroup) (*api.PodGroup, error) {
+	return pg, nil
+}
+
+func (r *recordingStatusUpdater) UpdateQueueStatus(queue *api.QueueInfo) error {
+	return nil
 }

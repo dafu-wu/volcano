@@ -38,6 +38,17 @@ func jobInfoEqual(l, r *JobInfo) bool {
 	return equality.Semantic.DeepEqual(l, r)
 }
 
+func TestNewTaskInfoRestoresPipelinedFromNominatedNode(t *testing.T) {
+	pod := buildPod("ns1", "p1", "", v1.PodPending, BuildResourceList("1", "1G"), nil, make(map[string]string))
+	pod.Status.NominatedNodeName = "n1"
+
+	task := NewTaskInfo(pod)
+
+	assert.Equal(t, Pipelined, task.Status)
+	assert.Equal(t, "n1", task.NodeName)
+	assert.True(t, task.EvictionOccurred)
+}
+
 func TestAddTaskInfo(t *testing.T) {
 	// case1
 	case01UID := JobID("uid")
