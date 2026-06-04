@@ -288,11 +288,8 @@ func (s StatusSets) ContainsDRAClaimAllocationFailure() bool {
 	return false
 }
 
-// draDynamicResourcesPluginName is the name of the upstream kube-scheduler
-// DynamicResources plugin that owns DRA claim allocation.
-const draDynamicResourcesPluginName = "DynamicResources"
-
 // draClaimAllocationFailureMarker is the substring used by upstream
+
 // kube-scheduler v1.31+ DynamicResources plugin to report that a node cannot
 // satisfy all ResourceClaim allocations. It is matched against status.Reason
 // because the upstream plugin does not expose a typed error code for this
@@ -301,10 +298,22 @@ const draDynamicResourcesPluginName = "DynamicResources"
 // Source reference (upstream): pkg/scheduler/framework/plugins/dynamicresources.
 const draClaimAllocationFailureMarker = "cannot allocate all claims"
 
+// isDRAClaimAllocationFailure reports whether the status represents the DRA
+// "cannot allocate all claims" failure, which is resolvable by preempt/reclaim
+// (claims can fail allocation only because devices are still held by victims in
+// the current snapshot; after eviction the same allocation may succeed).
+//
+// NOTE: We intentionally do NOT require status.Plugin == "DynamicResources".
+// Volcano's predicates plugin invokes the DRA plugin's Filter() directly rather
+// than through the kube-scheduler framework's RunFilterPlugins(), so the
+// framework never calls status.SetPlugin(pl.Name()). As a result the plugin
+// name on the returned status is empty and a strict Plugin-name check would
+// miss this failure, causing it to be (incorrectly) treated as a fatal
+// unresolvable status in preempt/reclaim. Matching on Code + the reason marker
+// is sufficient and robust regardless of whether the plugin name is populated.
 func isDRAClaimAllocationFailure(status *Status) bool {
 	return status != nil &&
 		status.Code == UnschedulableAndUnresolvable &&
-		status.Plugin == draDynamicResourcesPluginName &&
 		strings.Contains(status.Reason, draClaimAllocationFailureMarker)
 }
 

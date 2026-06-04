@@ -40,6 +40,19 @@ func TestContainsPreemptActionFatalStatus(t *testing.T) {
 			want: false,
 		},
 		{
+			// Volcano invokes the DRA plugin's Filter() directly (not via the
+			// framework's RunFilterPlugins), so the returned status has an empty
+			// Plugin name. The DRA "cannot allocate all claims" failure must still
+			// be recognized as preempt/reclaim resolvable regardless of plugin name.
+			name: "DRA allocation failure with empty plugin name is still resolvable",
+			statuses: StatusSets{
+				{Code: Unschedulable, Plugin: "", Reason: "node(s) didn't have free ports for the requested pod ports"},
+				{Code: UnschedulableAndUnresolvable, Plugin: "", Reason: "cannot allocate all claims"},
+			},
+			want: false,
+		},
+
+		{
 			name: "non DRA unresolvable status stays fatal",
 			statuses: StatusSets{
 				{Code: UnschedulableAndUnresolvable, Plugin: "NodeAffinity", Reason: "node(s) didn't match Pod's node affinity"},

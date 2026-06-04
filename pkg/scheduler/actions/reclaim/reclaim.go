@@ -162,7 +162,31 @@ func (ra *Action) Execute(ssn *framework.Session) {
 			continue
 		}
 
+		// Gang feasibility pre-check (dry-run, no side effects).
+		//
+		// Before evicting ANY victim for this gang job, simulate—on cloned node
+		// snapshots—whether the WHOLE job can reach its minMember this cycle by
+		// reclaiming available victims. If it cannot, skip the job entirely and do
+		// NOT evict a single victim.
+		//
+		// Rationale: stmt.Evict() has external side effects (it fires
+		// DeallocateFunc with ExternalResources=true, which can release a victim's
+		// DRA ResourceClaim / hostPort and trigger pod teardown) even before the
+		// statement is committed. If the gang ultimately can't be assembled, those
+		// victims are torn down in vain and respawn, producing a reclaim/respawn
+		// loop. The dry-run touches only cloned NodeInfos, so it never evicts or
+		// fires any handler; we only proceed to real eviction when the gang is
+		// proven satisfiable.
+		if !canReclaimGangForJob(ssn, job, task, totalNodesForJob(ssn, task)) {
+			klog.V(3).Infof("Reclaim skipped for Job <%s/%s>: gang cannot be satisfied this cycle by reclaiming victims; not evicting any victim.",
+				job.Namespace, job.Name)
+			// Re-queue is unnecessary: the job stays Inqueue and will be
+			// re-evaluated next session when resources may have changed.
+			continue
+		}
+
 		assigned := false
+
 		// we should filter out those nodes that are UnschedulableAndUnresolvable status got in allocate action
 		totalNodes := ssn.FilterOutUnschedulableAndUnresolvableNodesForTask(task)
 		for _, n := range totalNodes {
@@ -217,6 +241,16 @@ func (ra *Action) Execute(ssn *framework.Session) {
 
 			victims := ssn.Reclaimable(task, reclaimees)
 
+			// Job-level (all-or-nothing) victim selection.
+			//
+			// Reclaiming only SOME pods of a low-priority gang job breaks that
+			// job's gang (its surviving pods get torn down and the whole job is
+			// recreated), wasting work. So once we decide to reclaim a victim job,
+			// we expand the victim set to ALL of that job's reclaimable running
+			// pods, evicting it as a whole. This keeps reclaim victim selection
+			// consistent with gang semantics and avoids killing half a job.
+			victims = expandVictimsToWholeJobs(ssn, job, victims)
+
 			if err := util.ValidateVictims(task, n, victims); err != nil {
 				klog.V(3).Infof("No validated victims on Node <%s>: %v", n.Name, err)
 				continue
@@ -226,6 +260,9 @@ func (ra *Action) Execute(ssn *framework.Session) {
 
 			resreq := task.InitResreq.Clone()
 			reclaimed := api.EmptyResource()
+			// Track victims staged for eviction on this node so we can roll them
+			// back if the preemptor still can't be placed after eviction.
+			evicted := make([]*api.TaskInfo, 0)
 
 			// Reclaim victims for tasks.
 			for !victimsQueue.Empty() {
@@ -237,6 +274,7 @@ func (ra *Action) Execute(ssn *framework.Session) {
 						reclaimee.Namespace, reclaimee.Name, task.Namespace, task.Name, err)
 					continue
 				}
+				evicted = append(evicted, reclaimee)
 				reclaimed.Add(reclaimee.Resreq)
 				// If reclaimed enough resources, break loop to avoid Sub panic.
 				if resreq.LessEqual(reclaimed, api.Zero) {
@@ -247,17 +285,59 @@ func (ra *Action) Execute(ssn *framework.Session) {
 			klog.V(3).Infof("Reclaimed <%v> for task <%s/%s> requested <%v>.",
 				reclaimed, task.Namespace, task.Name, task.InitResreq)
 
-			if task.InitResreq.LessEqual(reclaimed, api.Zero) {
-				if err := stmt.Pipeline(task, n.Name, true); err != nil {
-					klog.Errorf("Failed to pipeline Task <%s/%s> on Node <%s>",
-						task.Namespace, task.Name, n.Name)
+			// rollbackEvictions rolls back all victims staged on this node, so a
+			// failed attempt never kills victims for real (eviction only happens
+			// on stmt.Commit()).
+			rollbackEvictions := func() {
+				for i := len(evicted) - 1; i >= 0; i-- {
+					if err := stmt.UnEvict(evicted[i]); err != nil {
+						klog.Errorf("Failed to roll back eviction of Task <%s/%s> on Node <%s>: %v",
+							evicted[i].Namespace, evicted[i].Name, n.Name, err)
+					}
 				}
-
-				// Ignore error of pipeline, will be corrected in next scheduling loop.
-				assigned = true
-
-				break
 			}
+
+			if !task.InitResreq.LessEqual(reclaimed, api.Zero) {
+				// Not enough reclaimed on this node; roll back and try next node.
+				rollbackEvictions()
+				continue
+			}
+
+			// validate-then-evict gate: the victims above were staged (in-session)
+			// to free their resources on this node. Re-run the preempt-action
+			// predicate to confirm the preemptor can be placed here after those
+			// victims are gone, BEFORE we let the eviction be committed.
+			//
+			// We deliberately use PredicateForPreemptAction (not the full
+			// PredicateFn) so that failures which are only resolvable across
+			// scheduling cycles are still treated as resolvable:
+			//   - DRA "cannot allocate all claims": a victim's ResourceClaim is
+			//     released only after the pod is actually deleted, not when it is
+			//     marked Releasing in-session, so the DRA Filter still reports this
+			//     in the same cycle even though it WILL be satisfiable next cycle.
+			//   - hostPort conflicts: the port frees up only after the victim pod
+			//     terminates.
+			// Using the full PredicateFn here would mis-classify these as fatal and
+			// abort every candidate node, effectively disabling reclaim. The
+			// preempt-action predicate still rejects truly unresolvable constraints
+			// (e.g. NodeAffinity) and insufficient resources after eviction, which
+			// is what we need to avoid evicting victims in vain.
+			if err := ssn.PredicateForPreemptAction(task, n); err != nil {
+				klog.V(3).Infof("Reclaim aborted on Node <%s> for Task <%s/%s>: not schedulable after evicting victims: %v",
+					n.Name, task.Namespace, task.Name, err)
+				rollbackEvictions()
+				continue
+			}
+
+			if err := stmt.Pipeline(task, n.Name, true); err != nil {
+				klog.Errorf("Failed to pipeline Task <%s/%s> on Node <%s>",
+					task.Namespace, task.Name, n.Name)
+			}
+
+			// Ignore error of pipeline, will be corrected in next scheduling loop.
+			assigned = true
+
+			break
 		}
 
 		if assigned {
@@ -274,4 +354,162 @@ func (ra *Action) Execute(ssn *framework.Session) {
 }
 
 func (ra *Action) UnInitialize() {
+}
+
+// totalNodesForJob returns the candidate node set used both by the gang
+// feasibility pre-check and the real reclaim pass, so the dry-run and the apply
+// phase reason over the same nodes.
+func totalNodesForJob(ssn *framework.Session, task *api.TaskInfo) []*api.NodeInfo {
+	return ssn.FilterOutUnschedulableAndUnresolvableNodesForTask(task)
+}
+
+// collectReclaimableVictimResreq returns the total resource of tasks on the node
+// that the given preemptor job is allowed to reclaim (running, preemptable, and
+// belonging to a different, reclaimable queue).
+func collectReclaimableVictimResreq(ssn *framework.Session, job *api.JobInfo, node *api.NodeInfo) *api.Resource {
+	total := api.EmptyResource()
+	for _, t := range node.Tasks {
+		if t.Status != api.Running || !t.Preemptable {
+			continue
+		}
+		j, found := ssn.Jobs[t.Job]
+		if !found || j.Queue == job.Queue {
+			continue
+		}
+		if q, ok := ssn.Queues[j.Queue]; !ok || !q.Reclaimable() {
+			continue
+		}
+		total.Add(t.Resreq)
+	}
+	return total
+}
+
+// canReclaimGangForJob dry-runs reclaim for the whole job on cloned node
+// snapshots and reports whether the job can reach minMember this cycle by
+// reclaiming victims.
+//
+// It performs NO real eviction and fires NO event handlers: all mutations happen
+// on cloned NodeInfos, so victims are never disturbed. This lets the caller skip
+// a gang entirely (evicting nothing) when it cannot be assembled, preventing the
+// reclaim/respawn loop caused by evicting victims for a gang that won't fit.
+func canReclaimGangForJob(ssn *framework.Session, job *api.JobInfo, sampleTask *api.TaskInfo, candidateNodes []*api.NodeInfo) bool {
+	// Tasks still needed to satisfy the gang's minMember.
+	needed := int(job.MinAvailable) - int(job.ReadyTaskNum()) - int(job.WaitingTaskNum())
+	if needed <= 0 {
+		// Already satisfied/pipelined enough; reclaim has nothing to gate on.
+		return true
+	}
+
+	// Pending tasks of this job that still need placement, in scheduling order.
+	pending := make([]*api.TaskInfo, 0, len(job.TaskStatusIndex[api.Pending]))
+	for _, t := range job.TaskStatusIndex[api.Pending] {
+		if t.SchGated {
+			continue
+		}
+		pending = append(pending, t)
+	}
+	if len(pending) == 0 {
+		return false
+	}
+
+	// Clone candidate node snapshots so the simulation has no side effects, and
+	// pre-compute each node's reclaimable victim resources.
+	type simNode struct {
+		node       *api.NodeInfo
+		victimRes  *api.Resource
+		usedByPlan bool
+	}
+	sims := make([]*simNode, 0, len(candidateNodes))
+	for _, n := range candidateNodes {
+		sims = append(sims, &simNode{
+			node:      n.Clone(),
+			victimRes: collectReclaimableVictimResreq(ssn, job, n),
+		})
+	}
+
+	placed := 0
+	for _, t := range pending {
+		if placed >= needed {
+			break
+		}
+		for _, sn := range sims {
+			if sn.usedByPlan {
+				continue
+			}
+			// Only consider nodes the preemptor task can be placed on under the
+			// preempt-action predicate (keeps DRA/hostPort resolvable, rejects
+			// truly unresolvable constraints), consistent with the apply phase.
+			if err := ssn.PredicateForPreemptAction(t, sn.node); err != nil {
+				continue
+			}
+			// Available capacity after reclaiming this node's victims.
+			avail := sn.node.FutureIdle().Clone().Add(sn.victimRes)
+			if t.InitResreq.LessEqual(avail, api.Zero) {
+				sn.usedByPlan = true
+				placed++
+				break
+			}
+		}
+	}
+
+	return placed >= needed
+}
+
+// expandVictimsToWholeJobs expands a set of per-pod victims into whole-job
+// victim sets: for every victim job referenced by `victims`, ALL of that job's
+// reclaimable running pods are included.
+//
+// Reclaim is gang-aware on the preemptor side; it must be gang-aware on the
+// victim side too. Evicting only part of a low-priority gang job breaks its gang
+// (the surviving pods are torn down and the whole job is recreated), which
+// wastes work and can cause churn. Selecting victims at job granularity
+// (all-or-nothing) ensures that whenever we touch a victim job we free its
+// entire footprint cleanly.
+//
+// Only running, preemptable pods from a different, reclaimable queue are
+// included (the same eligibility used when collecting per-pod victims), and
+// tasks are cloned so node/job state is not mutated.
+func expandVictimsToWholeJobs(ssn *framework.Session, preemptor *api.JobInfo, victims []*api.TaskInfo) []*api.TaskInfo {
+	if len(victims) == 0 {
+		return victims
+	}
+
+	// Collect the distinct victim jobs.
+	victimJobIDs := make(map[api.JobID]struct{}, len(victims))
+	for _, v := range victims {
+		victimJobIDs[v.Job] = struct{}{}
+	}
+
+	expanded := make([]*api.TaskInfo, 0, len(victims))
+	seen := make(map[api.TaskID]struct{}, len(victims))
+	for jobID := range victimJobIDs {
+		vjob, found := ssn.Jobs[jobID]
+		if !found {
+			continue
+		}
+		// Safety: never reclaim from the preemptor's own queue.
+		if vjob.Queue == preemptor.Queue {
+			continue
+		}
+		if q, ok := ssn.Queues[vjob.Queue]; !ok || !q.Reclaimable() {
+			continue
+		}
+		for _, t := range vjob.Tasks {
+			if t.Status != api.Running || !t.Preemptable {
+				continue
+			}
+			if _, dup := seen[t.UID]; dup {
+				continue
+			}
+			seen[t.UID] = struct{}{}
+			expanded = append(expanded, t.Clone())
+		}
+	}
+
+	if len(expanded) == 0 {
+		// Fall back to the original victims if expansion produced nothing
+		// (should not normally happen), to avoid losing reclaim capability.
+		return victims
+	}
+	return expanded
 }

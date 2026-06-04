@@ -161,3 +161,45 @@ func TestSessionPipelineDoesNotUseExternalResources(t *testing.T) {
 		t.Fatalf("Session Pipeline AllocateFunc Operation = %v, want [%s]", allocateOps, EventPipeline)
 	}
 }
+
+func TestStatementUnEvictRollsBackAndRemovesOperation(t *testing.T) {
+	ssn, task, node := newEventFlagTestSession()
+
+	// Place the task on the node as Running so it can be evicted.
+	task.NodeName = node.Name
+	if job, ok := ssn.Jobs[task.Job]; ok {
+		_ = job.UpdateTaskStatus(task, api.Running)
+	}
+	if err := node.AddTask(task); err != nil {
+		t.Fatalf("AddTask returned error: %v", err)
+	}
+
+	stmt := NewStatement(ssn)
+	if err := stmt.Evict(task, "reclaim"); err != nil {
+		t.Fatalf("Evict returned error: %v", err)
+	}
+	if got := len(stmt.Operations()); got != 1 {
+		t.Fatalf("after Evict, operations = %d, want 1", got)
+	}
+	if task.Status != api.Releasing {
+		t.Fatalf("after Evict, task status = %v, want Releasing", task.Status)
+	}
+
+	// UnEvict should roll back the status and drop the Evict operation so it is
+	// not processed again on Discard/Commit.
+	if err := stmt.UnEvict(task); err != nil {
+		t.Fatalf("UnEvict returned error: %v", err)
+	}
+	if got := len(stmt.Operations()); got != 0 {
+		t.Fatalf("after UnEvict, operations = %d, want 0", got)
+	}
+	if task.Status != api.Running {
+		t.Fatalf("after UnEvict, task status = %v, want Running", task.Status)
+	}
+
+	// Discard must be a no-op now (no double rollback / panic).
+	stmt.Discard()
+	if task.Status != api.Running {
+		t.Fatalf("after Discard, task status = %v, want Running", task.Status)
+	}
+}

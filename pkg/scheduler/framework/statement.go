@@ -157,7 +157,36 @@ func (s *Statement) unevict(reclaimee *api.TaskInfo) error {
 	return nil
 }
 
+// UnEvict rolls back a previously staged Evict for the given task and removes
+// the corresponding Evict entry from this statement's operations, so it is not
+// processed again on Commit/Discard.
+//
+// This enables a "validate-then-evict" pattern: a caller may stage Evict()s to
+// update the in-session node snapshot (freeing the victims' resources,
+// hostPorts, DRA claims, etc.), re-run a full predicate to confirm the
+// preemptor can actually be placed, and—if not—roll back those staged evictions
+// without ever killing the victims for real (real eviction only happens on
+// Commit).
+func (s *Statement) UnEvict(reclaimee *api.TaskInfo) error {
+	reclaimee.GenerateLastTxContext()
+	if err := s.unevict(reclaimee); err != nil {
+		return err
+	}
+
+	// Remove the matching Evict operation (last one for this task) so Discard
+	// or Commit won't process it again.
+	for i := len(s.operations) - 1; i >= 0; i-- {
+		op := s.operations[i]
+		if op.name == Evict && op.task.UID == reclaimee.UID {
+			s.operations = append(s.operations[:i], s.operations[i+1:]...)
+			break
+		}
+	}
+	return nil
+}
+
 // Pipeline the task for the node
+
 func (s *Statement) Pipeline(task *api.TaskInfo, hostname string, evictionOccurred bool) error {
 	errInfos := make([]error, 0)
 	job, found := s.ssn.Jobs[task.Job]
